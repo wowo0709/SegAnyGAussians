@@ -96,66 +96,51 @@ if __name__ == '__main__':
     assert os.path.join(dataset.source_path, 'sam_masks') and "Please run extract_segment_everything_masks first."
 
     from tqdm import tqdm
-    images_masks = {}
-    for i, image_path in tqdm(enumerate(sorted(os.listdir(os.path.join(dataset.source_path, 'images'))))):
-        # print(image_path)
-        image = cv2.imread(os.path.join(os.path.join(dataset.source_path, 'images'), image_path))
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        masks = torch.load(os.path.join(os.path.join(dataset.source_path, 'sam_masks'), image_path.replace('jpg', 'pt').replace('JPG', 'pt').replace('png', 'pt')))
-        # N_mask, C
-
-        images_masks[image_path.split('.')[0]] = masks.cpu().float()
-
-
     OUTPUT_DIR = os.path.join(args.image_root, 'mask_scales')
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     cameras = scene.getTrainCameras()
+    background = torch.zeros(scene_gaussians.get_mask.shape[0], 3, device='cuda')
+    render_pipe = pipeline.extract(args)
 
-    background = torch.zeros(scene_gaussians.get_mask.shape[0], 3, device = 'cuda')
+    with torch.no_grad():
+        for it, view in tqdm(enumerate(cameras), total=len(cameras)):
+            rendered_pkg = gaussian_renderer.render_with_depth(view, scene_gaussians, render_pipe, background)
+            depth = rendered_pkg['depth'].squeeze().cpu()
 
-    for it, view in tqdm(enumerate(cameras)):
+            mask_path = os.path.join(dataset.source_path, 'sam_masks', view.image_name + '.pt')
+            corresponding_masks = torch.load(mask_path, map_location='cpu').float()
 
-        rendered_pkg = gaussian_renderer.render_with_depth(view, scene_gaussians, pipeline.extract(args), background)
+            grid_index = generate_grid_index(depth)
+            points_in_3D = torch.zeros(depth.shape[0], depth.shape[1], 3)
+            points_in_3D[:, :, -1] = depth
 
-        depth = rendered_pkg['depth']
+            # caluculate cx cy fx fy with FoVx FoVy
+            cx = depth.shape[1] / 2
+            cy = depth.shape[0] / 2
+            fx = cx / np.tan(cameras[0].FoVx / 2)
+            fy = cy / np.tan(cameras[0].FoVy / 2)
 
-        # plt.imshow(depth.detach().cpu().squeeze().numpy())
-        corresponding_masks = images_masks[view.image_name]
+            points_in_3D[:, :, 0] = (grid_index[:, :, 0] - cx) * depth / fx
+            points_in_3D[:, :, 1] = (grid_index[:, :, 1] - cy) * depth / fy
 
-        # generate_grid_index(depth.squeeze())[50, 1]
+            upsampled_mask = torch.nn.functional.interpolate(
+                corresponding_masks.unsqueeze(1),
+                mode='bilinear',
+                size=(depth.shape[0], depth.shape[1]),
+                align_corners=False,
+            )
 
-        depth = depth.cpu().squeeze()
+            eroded_masks = torch.conv2d(
+                upsampled_mask.float(),
+                torch.full((3, 3), 1.0).view(1, 1, 3, 3),
+                padding=1,
+            )
+            eroded_masks = (eroded_masks >= 5).squeeze()  # (num_masks, H, W)
 
-        grid_index = generate_grid_index(depth)
+            scale = torch.zeros(len(corresponding_masks))
+            for mask_id in range(len(corresponding_masks)):
+                point_in_3D_in_mask = points_in_3D[eroded_masks[mask_id] == 1]
+                scale[mask_id] = (point_in_3D_in_mask.std(dim=0) * 2).norm()
 
-        points_in_3D = torch.zeros(depth.shape[0], depth.shape[1], 3).cpu()
-        points_in_3D[:,:,-1] = depth
-
-        # caluculate cx cy fx fy with FoVx FoVy
-        cx = depth.shape[1] / 2
-        cy = depth.shape[0] / 2
-        fx = cx / np.tan(cameras[0].FoVx / 2)
-        fy = cy / np.tan(cameras[0].FoVy / 2)
-
-
-        points_in_3D[:,:,0] = (grid_index[:,:,0] - cx) * depth / fx
-        points_in_3D[:,:,1] = (grid_index[:,:,1] - cy) * depth / fy
-
-        upsampled_mask = torch.nn.functional.interpolate(corresponding_masks.unsqueeze(1), mode = 'bilinear', size = (depth.shape[0], depth.shape[1]), align_corners = False)
-
-        eroded_masks = torch.conv2d(
-            upsampled_mask.float(),
-            torch.full((3, 3), 1.0).view(1, 1, 3, 3),
-            padding=1,
-        )
-        eroded_masks = (eroded_masks >= 5).squeeze()  # (num_masks, H, W)
-
-        scale = torch.zeros(len(corresponding_masks))
-        for mask_id in range(len(corresponding_masks)):
-            
-            point_in_3D_in_mask = points_in_3D[eroded_masks[mask_id] == 1]
-
-            scale[mask_id] = (point_in_3D_in_mask.std(dim=0) * 2).norm()
-
-        torch.save(scale, os.path.join(OUTPUT_DIR, view.image_name + '.pt'))
+            torch.save(scale, os.path.join(OUTPUT_DIR, view.image_name + '.pt'))
