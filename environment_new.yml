@@ -1,0 +1,27 @@
+name: saga
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip=24
+  - plyfile=0.8.1
+  - tqdm
+  - hdbscan
+  - matplotlib
+  - joblib=1.1.0
+  - ninja
+  - cmake
+  - setuptools
+  - wheel
+
+  - pip:
+    - --extra-index-url https://download.pytorch.org/whl/cu124
+    - torch==2.6.0+cu124
+    - torchvision==0.21.0+cu124
+    - torchaudio==2.6.0+cu124
+    - git+https://github.com/facebookresearch/segment-anything.git
+    - dearpygui
+    - opencv-python
+    - open-clip-torch
