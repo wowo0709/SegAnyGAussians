@@ -11,13 +11,23 @@
 
 import torch
 import numpy as np
+import os
+import sys
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
-import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
-from simple_knn._C import distCUDA2
+
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from simple_knn._C import distCUDA2
+except ModuleNotFoundError:
+    _submodule_path = os.path.join(_ROOT_DIR, "submodules", "simple-knn")
+    if _submodule_path not in sys.path:
+        sys.path.insert(0, _submodule_path)
+    from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 

@@ -234,42 +234,55 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             FovX = fovx
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                            features=None, masks=None, mask_scales=None,
                             image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
             
     return cam_infos
 
-# for lerf test
+def _resolve_lerf_image_path(scene_path, file_path, extension):
+    image_path = os.path.normpath(os.path.join(scene_path, file_path))
+    if os.path.exists(image_path):
+        return image_path
+
+    normalized_rel = file_path[2:] if file_path.startswith("./") else file_path
+    candidate_paths = [
+        os.path.join(scene_path, normalized_rel),
+        os.path.join(scene_path, "images", os.path.basename(normalized_rel)),
+    ]
+    stem, suffix = os.path.splitext(normalized_rel)
+    if not suffix and extension:
+        candidate_paths.extend([
+            os.path.join(scene_path, stem + extension),
+            os.path.join(scene_path, "images", os.path.basename(stem + extension)),
+        ])
+
+    for candidate in candidate_paths:
+        candidate = os.path.normpath(candidate)
+        if os.path.exists(candidate):
+            return candidate
+
+    raise FileNotFoundError(f"Could not resolve LERF frame path '{file_path}' under '{scene_path}'.")
+
+
 def readCamerasFromLerfTransforms(path, transformsfile, white_background, extension=".jpg"):
     cam_infos = []
 
     with open(os.path.join(path, transformsfile)) as json_file:
         contents = json.load(json_file)
-        # fovx = contents["camera_angle_x"]
-
-        
-
         frames = contents["frames"]
         for idx, frame in enumerate(frames):
-            # cam_name = os.path.join(path, frame["file_path"])
-
             tmp = np.array(frame["transform_matrix"])
             tmp_R = tmp[:3,:3]
             tmp_R = -tmp_R
             tmp_R[:,0] = -tmp_R[:,0]
             tmp[:3,:3] = tmp_R
             matrix = np.linalg.inv(tmp)
-            # R = -np.transpose(matrix[:3,:3])
-            # R[:,0] = -R[:,0]
-            # T = -matrix[:3, 3]
-
-            # matrix[:3,1] *= -1
-            # matrix[:3,2] *= -1
 
             R = np.transpose(matrix[:3,:3])
             T = matrix[:3, 3]
 
-            image_path = os.path.join(path, frame["file_path"])
-            image_name = frame["file_path"].split("/")[-1].split(".")[0]
+            image_path = _resolve_lerf_image_path(path, frame["file_path"], extension)
+            image_name = Path(image_path).stem
             image = Image.open(image_path)
 
             im_data = np.array(image.convert("RGBA"))
@@ -280,16 +293,17 @@ def readCamerasFromLerfTransforms(path, transformsfile, white_background, extens
             arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
             image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
 
-            # fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
             fovx = 2 * np.arctan(frame['w'] / (2 * frame['fl_x']))
             fovy = 2 * np.arctan(frame['h'] / (2 * frame['fl_y']))
 
-            FovY = fovy 
+            FovY = fovy
             FovX = fovx
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1], features = None, masks = None, mask_scales = None))
-            
+                            features=None, masks=None, mask_scales=None,
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
+                            cx=frame.get("cx"), cy=frame.get("cy")))
+
     return cam_infos
 
 def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
@@ -306,15 +320,21 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
 
     ply_path = os.path.join(path, "points3d.ply")
     if not os.path.exists(ply_path):
-        # Since this data set has no colmap data, we start with random points
         num_pts = 100_000
         print(f"Generating random point cloud ({num_pts})...")
-        
-        # We create random points inside the bounds of the synthetic Blender scenes
-        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
-        shs = np.random.random((num_pts, 3)) / 255.0
-        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
 
+        cam_centers = []
+        for cam in train_cam_infos:
+            world_to_view = getWorld2View2(cam.R, cam.T)
+            cam_to_world = np.linalg.inv(world_to_view)
+            cam_centers.append(cam_to_world[:3, 3])
+        cam_centers = np.stack(cam_centers, axis=0)
+        center = cam_centers.mean(axis=0)
+        radius = np.linalg.norm(cam_centers - center, axis=1).max()
+        radius = max(radius, 1.0)
+
+        xyz = (np.random.random((num_pts, 3)) * 2.0 - 1.0) * radius + center
+        shs = np.random.random((num_pts, 3)) / 255.0
         storePly(ply_path, xyz, SH2RGB(shs) * 255)
     try:
         pcd = fetchPly(ply_path)
@@ -328,13 +348,10 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
-def readLerfInfo(path, white_background, eval, extension=".png"):
+def readLerfInfo(path, white_background, eval, extension=".jpg"):
     print("Reading Training Transforms")
     train_cam_infos = readCamerasFromLerfTransforms(path, "transforms.json", white_background, extension)
-    # print("Reading Test Transforms")
-    # test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
     test_cam_infos = []
-    eval = False
     if not eval:
         train_cam_infos.extend(test_cam_infos)
         test_cam_infos = []
@@ -343,15 +360,21 @@ def readLerfInfo(path, white_background, eval, extension=".png"):
 
     ply_path = os.path.join(path, "points3d.ply")
     if not os.path.exists(ply_path):
-        # Since this data set has no colmap data, we start with random points
         num_pts = 100_000
         print(f"Generating random point cloud ({num_pts})...")
-        
-        # We create random points inside the bounds of the synthetic Blender scenes
-        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
-        shs = np.random.random((num_pts, 3)) / 255.0
-        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
 
+        cam_centers = []
+        for cam in train_cam_infos:
+            world_to_view = getWorld2View2(cam.R, cam.T)
+            cam_to_world = np.linalg.inv(world_to_view)
+            cam_centers.append(cam_to_world[:3, 3])
+        cam_centers = np.stack(cam_centers, axis=0)
+        center = cam_centers.mean(axis=0)
+        radius = np.linalg.norm(cam_centers - center, axis=1).max()
+        radius = max(radius, 1.0)
+
+        xyz = (np.random.random((num_pts, 3)) * 2.0 - 1.0) * radius + center
+        shs = np.random.random((num_pts, 3)) / 255.0
         storePly(ply_path, xyz, SH2RGB(shs) * 255)
     try:
         pcd = fetchPly(ply_path)

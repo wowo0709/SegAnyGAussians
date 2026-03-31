@@ -15,7 +15,10 @@ import json
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks, fetchPly
 from scene.gaussian_model import GaussianModel
-from scene.gaussian_model_ff import FeatureGaussianModel
+try:
+    from scene.gaussian_model_ff import FeatureGaussianModel
+except Exception:
+    FeatureGaussianModel = None
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
@@ -94,17 +97,15 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
-        # used for testing lerf transforms,json
-        # and not os.path.exists(os.path.join(args.source_path, "transforms.json")):
+        if os.path.exists(os.path.join(args.source_path, "sparse")) and not os.path.exists(os.path.join(args.source_path, "transforms.json")):
             print(f"Allow Camera Principle Point Shift: {args.allow_principle_point_shift}")
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, need_features = args.need_features, need_masks = args.need_masks, sample_rate = sample_rate, allow_principle_point_shift = args.allow_principle_point_shift, replica = 'replica' in args.model_path)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
-        # elif os.path.exists(os.path.join(args.source_path, "transforms.json")):
-        #     print("Found transforms.json file, assuming Lerf data set!")
-        #     scene_info = sceneLoadTypeCallbacks["Lerf"](args.source_path, args.white_background, args.eval)
+        elif os.path.exists(os.path.join(args.source_path, "transforms.json")):
+            print("Found transforms.json file, assuming Lerf data set!")
+            scene_info = sceneLoadTypeCallbacks["Lerf"](args.source_path, args.white_background, args.eval)
         else:
             assert False, "Could not recognize scene type!"
 

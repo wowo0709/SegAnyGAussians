@@ -11,7 +11,18 @@
 
 import torch
 import math
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+import os
+import sys
+
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+except ModuleNotFoundError:
+    _submodule_path = os.path.join(_ROOT_DIR, "submodules", "diff-gaussian-rasterization")
+    if _submodule_path not in sys.path:
+        sys.path.insert(0, _submodule_path)
+    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
@@ -189,14 +200,19 @@ def render_mask(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Ten
             "visibility_filter" : radii > 0,
             "radii": radii}
 
-from diff_gaussian_rasterization_depth import GaussianRasterizationSettings as GaussianRasterizationSettingsDepth, GaussianRasterizer as GaussianRasterizerDepth
-
 def render_with_depth(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, override_mask = None, filtered_mask = None):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
     """
+    try:
+        from diff_gaussian_rasterization_depth import GaussianRasterizationSettings as GaussianRasterizationSettingsDepth, GaussianRasterizer as GaussianRasterizerDepth
+    except ModuleNotFoundError:
+        _submodule_path = os.path.join(_ROOT_DIR, "submodules", "diff-gaussian-rasterization-depth")
+        if _submodule_path not in sys.path:
+            sys.path.insert(0, _submodule_path)
+        from diff_gaussian_rasterization_depth import GaussianRasterizationSettings as GaussianRasterizationSettingsDepth, GaussianRasterizer as GaussianRasterizerDepth
     # start_time  = time.time()
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
@@ -293,16 +309,21 @@ def render_with_depth(viewpoint_camera, pc : GaussianModel, pipe, bg_color : tor
             "visibility_filter" : radii > 0,
             "radii": radii}
 
-from diff_gaussian_rasterization_contrastive_f import GaussianRasterizationSettings as GaussianRasterizationSettingsContrastiveF
-from diff_gaussian_rasterization_contrastive_f import GaussianRasterizer as GaussianRasterizerContrastiveF
-from scene.gaussian_model_ff import FeatureGaussianModel
-
-def render_contrastive_feature(viewpoint_camera, pc : FeatureGaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, norm_point_features = False, smooth_type = None, smooth_weights = None, smooth_K = 16):
+def render_contrastive_feature(viewpoint_camera, pc, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, norm_point_features = False, smooth_type = None, smooth_weights = None, smooth_K = 16):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
     """
+    try:
+        from diff_gaussian_rasterization_contrastive_f import GaussianRasterizationSettings as GaussianRasterizationSettingsContrastiveF
+        from diff_gaussian_rasterization_contrastive_f import GaussianRasterizer as GaussianRasterizerContrastiveF
+    except ModuleNotFoundError:
+        _submodule_path = os.path.join(_ROOT_DIR, "submodules", "diff-gaussian-rasterization_contrastive_f")
+        if _submodule_path not in sys.path:
+            sys.path.insert(0, _submodule_path)
+        from diff_gaussian_rasterization_contrastive_f import GaussianRasterizationSettings as GaussianRasterizationSettingsContrastiveF
+        from diff_gaussian_rasterization_contrastive_f import GaussianRasterizer as GaussianRasterizerContrastiveF
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
