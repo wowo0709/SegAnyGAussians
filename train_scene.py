@@ -231,3 +231,9 @@ if __name__ == "__main__":
 
     # All done
     print("\nTraining complete.")
+
+
+
+"""
+CUDA_VISIBLE_DEVICES=0 python train_scene.py -s /root/node1/data2/diyscene/mipnerf360/360_v2/bicycle -m /root/node1/data2/diyscene/3dgs/fitted_gs/mipnerf360/360_v2/bicycle
+"""

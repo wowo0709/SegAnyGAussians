@@ -77,3 +77,12 @@ if __name__ == '__main__':
         masks = torch.stack(mask_list, dim=0)
 
         torch.save(masks, os.path.join(OUTPUT_DIR, name+'.pt'))
+
+
+
+"""
+[Download SAM checkpoint]
+mkdir -p /root/dev/SegAnyGAussians/third_party/segment-anything/sam_ckpt
+cd /root/dev/SegAnyGAussians/third_party/segment-anything/sam_ckpt
+wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth
+"""

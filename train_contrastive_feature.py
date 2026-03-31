@@ -619,5 +619,9 @@ if __name__ == "__main__":
 
 
 """
-
+CUDA_VISIBLE_DEVICES=0 python train_contrastive_feature.py \
+    -s /root/node1/data2/diyscene/mipnerf360/360_v2/garden \
+    -m /root/node1/data2/diyscene/3dgs/fitted_gs/mipnerf360/360_v2/garden \
+    --iterations 10000 --num_sampled_rays 1000 \
+    --viz_interval 1000 --viz_view_idx 0 --viz_mode embedding --viz_max_samples 5000
 """
