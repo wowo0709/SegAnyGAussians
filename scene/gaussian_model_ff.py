@@ -17,6 +17,44 @@ import sys
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 from utils.system_utils import mkdir_p
+
+
+def _knn_points_idx(xyz, reference_xyz, K):
+    try:
+        return pytorch3d.ops.knn_points(
+            xyz.unsqueeze(0),
+            reference_xyz.unsqueeze(0),
+            K=K,
+        ).idx.squeeze()
+    except RuntimeError as exc:
+        if "Not compiled with GPU support" not in str(exc):
+            raise
+
+        print("PyTorch3D KNN has no GPU support in this env. Falling back to CPU KNN for feature smoothing.")
+        idx = pytorch3d.ops.knn_points(
+            xyz.detach().cpu().unsqueeze(0),
+            reference_xyz.detach().cpu().unsqueeze(0),
+            K=K,
+        ).idx.squeeze()
+        return idx.to(xyz.device)
+
+
+def _chunked_neighbor_mean(normed_features, select_idx, target_chunk_bytes=128 * 1024 * 1024):
+    if select_idx.numel() == 0:
+        return normed_features.new_empty((0, normed_features.shape[-1]))
+
+    feature_dim = normed_features.shape[-1]
+    effective_k = max(select_idx.shape[-1], 1)
+    bytes_per_value = normed_features.element_size()
+    values_per_point = effective_k * feature_dim
+    bytes_per_point = max(values_per_point * bytes_per_value, 1)
+    chunk_size = max(target_chunk_bytes // bytes_per_point, 1)
+
+    outputs = []
+    for start in range(0, select_idx.shape[0], chunk_size):
+        end = min(start + chunk_size, select_idx.shape[0])
+        outputs.append(normed_features[select_idx[start:end], :].mean(dim=1))
+    return torch.cat(outputs, dim=0)
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
 
@@ -333,11 +371,7 @@ class FeatureGaussianModel:
     def smooth_point_features(self, K = 16, smoothed_dim = 24):
         if self.feature_smooth_map is None or self.feature_smooth_map["K"] != K:
             xyz = self.get_xyz
-            nearest_k_idx = pytorch3d.ops.knn_points(
-                xyz.unsqueeze(0),
-                xyz.unsqueeze(0),
-                K=K,
-            ).idx.squeeze()
+            nearest_k_idx = _knn_points_idx(xyz, xyz, K)
             self.feature_smooth_map = {"K":K, "m":nearest_k_idx}
 
         cur_features = self._point_features
@@ -354,11 +388,7 @@ class FeatureGaussianModel:
         with torch.no_grad():
             if self.feature_smooth_map is None or self.feature_smooth_map["K"] != K:
                 xyz = self.get_xyz
-                nearest_k_idx = pytorch3d.ops.knn_points(
-                    xyz.unsqueeze(0),
-                    xyz.unsqueeze(0),
-                    K=K,
-                ).idx.squeeze()
+                nearest_k_idx = _knn_points_idx(xyz, xyz, K)
                 self.feature_smooth_map = {"K":K, "m":nearest_k_idx}
 
         normed_features = torch.nn.functional.normalize(self._point_features, dim = -1, p = 2)
@@ -367,9 +397,9 @@ class FeatureGaussianModel:
             select_point = torch.randperm(K)[ : int(K*dropout)]
 
             select_idx = self.feature_smooth_map["m"][:, select_point]
-            ret = normed_features[select_idx, :].mean(dim = 1)
+            ret = _chunked_neighbor_mean(normed_features, select_idx)
         else:
-            ret = normed_features[self.feature_smooth_map["m"], :].mean(dim = 1)
+            ret = _chunked_neighbor_mean(normed_features, self.feature_smooth_map["m"])
 
         return ret
 
@@ -387,11 +417,7 @@ class FeatureGaussianModel:
 
                     pm = torch.rand(xyz.shape[0]) < r
 
-                    nearest_k_idx = pytorch3d.ops.knn_points(
-                        xyz.unsqueeze(0),
-                        xyz[pm].unsqueeze(0),
-                        K=k,
-                    ).idx.squeeze()
+                    nearest_k_idx = _knn_points_idx(xyz, xyz[pm], k)
 
                     if len(self.multi_res_feature_smooth_map) <= i:
                         self.multi_res_feature_smooth_map.append({"rate":r, "K":k, "point_mask": pm, "m":nearest_k_idx})
