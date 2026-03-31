@@ -1,6 +1,6 @@
 # Install after torch is present in the saga env.
-git+https://github.com/facebookresearch/pytorch3d.git
-submodules/diff-gaussian-rasterization
-submodules/diff-gaussian-rasterization_contrastive_f
-submodules/diff-gaussian-rasterization-depth
-submodules/simple-knn
+git+https://github.com/facebookresearch/pytorch3d.git@v0.7.9
+./submodules/diff-gaussian-rasterization
+./submodules/diff-gaussian-rasterization_contrastive_f
+./submodules/diff-gaussian-rasterization-depth
+./submodules/simple-knn
