@@ -215,7 +215,7 @@ class GaussianSplattingGUI:
         print("loading model file...")
         self.engine['scene'].load_ply(self.opt.SCENE_PCD_PATH)
         self.engine['feature'].load_ply(self.opt.FEATURE_PCD_PATH)
-        self.engine['scale_gate'].load_state_dict(torch.load(self.opt.SCALE_GATE_PATH))
+        self.engine['scale_gate'].load_state_dict(torch.load(self.opt.SCALE_GATE_PATH, weights_only=True))
         self.do_pca()   # calculate self.proj_mat
         self.load_model = True
 
@@ -548,13 +548,11 @@ class GaussianSplattingGUI:
         n = X.shape[0]
         mean = torch.mean(X, dim=0)
         X = X - mean
-        covariance_matrix = (1 / n) * torch.matmul(X.T, X).float()  # An old torch bug: matmul float32->float16, 
-        eigenvalues, eigenvectors = torch.eig(covariance_matrix, eigenvectors=True)
-        eigenvalues = torch.norm(eigenvalues, dim=1)
-        idx = torch.argsort(-eigenvalues)
-        eigenvectors = eigenvectors[:, idx]
-        proj_mat = eigenvectors[:, 0:n_components]
-        
+        covariance_matrix = (1 / n) * torch.matmul(X.T, X).float()  # An old torch bug: matmul float32->float16,
+        eigenvalues, eigenvectors = torch.linalg.eigh(covariance_matrix)
+        idx = torch.argsort(eigenvalues, descending=True)
+        proj_mat = eigenvectors[:, idx[:n_components]]
+
         return proj_mat
     
 
@@ -623,7 +621,7 @@ class GaussianSplattingGUI:
             print("loading model file...")
             self.engine['scene'].load_ply(self.opt.SCENE_PCD_PATH)
             self.engine['feature'].load_ply(self.opt.FEATURE_PCD_PATH)
-            self.engine['scale_gate'].load_state_dict(torch.load(self.opt.SCALE_GATE_PATH))
+            self.engine['scale_gate'].load_state_dict(torch.load(self.opt.SCALE_GATE_PATH, weights_only=True))
             self.do_pca()   # calculate self.proj_mat
             self.load_model = True
 

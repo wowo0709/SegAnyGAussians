@@ -19,7 +19,7 @@ rm -rf "$ROOT_DIR/submodules/simple-knn/build"
 find "$ROOT_DIR/submodules" -name '*.so' -delete
 find "$ROOT_DIR/submodules" -name '*.egg-info' -type d -prune -exec rm -rf {} +
 
-conda run -n saga pip install --no-build-isolation -r "$CUDA_EXT_REQ"
+conda run -n saga bash -lc "cd \"$ROOT_DIR\" && pip install --no-build-isolation -r \"$CUDA_EXT_REQ\""
 
 cat <<EOF
 [OK] saga environment is ready.
