@@ -17,6 +17,7 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid, cx = None, cy = None, features = None, masks = None, mask_scales = None,
+                 features_path = None, masks_path = None, mask_scales_path = None,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
                  ):
         super(Camera, self).__init__()
@@ -40,9 +41,12 @@ class Camera(nn.Module):
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
 
-        self.original_features = features
-        self.original_masks = masks
-        self.mask_scales = mask_scales
+        self._original_features = features
+        self._original_masks = masks
+        self._mask_scales = mask_scales
+        self._original_features_path = features_path
+        self._original_masks_path = masks_path
+        self._mask_scales_path = mask_scales_path
 
         # a dirty hack to make sure that the feature width is always 200
         self.feature_width = 100
@@ -63,6 +67,36 @@ class Camera(nn.Module):
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy, cx=cx, cy=cy, w=self.image_width, h=self.image_height).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+
+    def _load_tensor_from_path(self, path):
+        if path is None:
+            return None
+        return torch.load(path, map_location='cpu')
+
+    @property
+    def original_features(self):
+        if self._original_features is None and self._original_features_path is not None:
+            self._original_features = self._load_tensor_from_path(self._original_features_path)
+        return self._original_features
+
+    @property
+    def original_masks(self):
+        if self._original_masks is None and self._original_masks_path is not None:
+            self._original_masks = self._load_tensor_from_path(self._original_masks_path)
+        return self._original_masks
+
+    @property
+    def mask_scales(self):
+        if self._mask_scales is None and self._mask_scales_path is not None:
+            self._mask_scales = self._load_tensor_from_path(self._mask_scales_path)
+        return self._mask_scales
+
+    def release_auxiliary_data(self, clear_features=False, clear_mask_scales=False):
+        self._original_masks = None
+        if clear_features:
+            self._original_features = None
+        if clear_mask_scales:
+            self._mask_scales = None
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

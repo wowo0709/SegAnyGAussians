@@ -31,16 +31,29 @@ def mkdir_p(folder_path):
 def searchForMaxIteration(folder, target = "scene"):
     fnames = os.listdir(folder)
     saved_iters = []
+    valid_scene_names = {"scene_point_cloud.ply", "point_cloud.ply"}
     for fname in fnames:
         cur_dir = os.path.join(folder, fname)
-        plys = os.listdir(cur_dir)
+        if not os.path.isdir(cur_dir):
+            continue
+        try:
+            plys = os.listdir(cur_dir)
+        except OSError:
+            continue
         has_target_ply = False
         for p in plys:
-            if target in p:
+            if target == "scene":
+                if p in valid_scene_names:
+                    has_target_ply = True
+                    break
+            elif target in p:
                 has_target_ply = True
                 break
         if has_target_ply:
-            saved_iters.append(int(fname.split("_")[-1]))
+            try:
+                saved_iters.append(int(fname.split("_")[-1]))
+            except ValueError:
+                continue
     try:
         return max(saved_iters)
     except:

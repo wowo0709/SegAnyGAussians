@@ -1,0 +1,45 @@
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.a
+
+# GUI / export outputs
+segmentation_res/
+cluster_exports/
+scene_exports/
+
+# Logs / local runtime files
+*.log
+nohup.out
+
+# Common local data / model artifacts
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy

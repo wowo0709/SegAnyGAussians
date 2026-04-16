@@ -33,25 +33,51 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+start_or_reuse() {
+  local __pid_var="$1"
+  local service_name="$2"
+  local match_pattern="$3"
+  local log_path="$4"
+  shift 4
+
+  if pgrep -f "$match_pattern" >/dev/null 2>&1; then
+    echo "Reusing existing $service_name"
+    printf -v "$__pid_var" '%s' ""
+    return 0
+  fi
+
+  "$@" >"$log_path" 2>&1 &
+  local pid=$!
+  printf -v "$__pid_var" '%s' "$pid"
+  sleep 1
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "Failed to start $service_name. See $log_path" >&2
+    if [[ -s "$log_path" ]]; then
+      tail -n 40 "$log_path" >&2 || true
+    fi
+    return 1
+  fi
+}
+
 export DISPLAY="$DISPLAY_NUM"
 
 if ! xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
   Xvfb "$DISPLAY" -screen 0 "$SCREEN_GEOM" -ac +extension GLX +render -noreset >"$RUNTIME_DIR/xvfb.log" 2>&1 &
   XVFB_PID=$!
   sleep 2
+  if ! xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
+    echo "Failed to start Xvfb on $DISPLAY. See $RUNTIME_DIR/xvfb.log" >&2
+    tail -n 40 "$RUNTIME_DIR/xvfb.log" >&2 || true
+    exit 1
+  fi
 fi
 
-fluxbox -display "$DISPLAY" >"$RUNTIME_DIR/fluxbox.log" 2>&1 &
-FLUXBOX_PID=$!
-sleep 1
+start_or_reuse FLUXBOX_PID   "fluxbox"   "fluxbox -display $DISPLAY"   "$RUNTIME_DIR/fluxbox.log"   fluxbox -display "$DISPLAY"
 
-x11vnc -display "$DISPLAY" -rfbport "$VNC_PORT" -localhost -forever -shared -nopw >"$RUNTIME_DIR/x11vnc.log" 2>&1 &
-X11VNC_PID=$!
-sleep 1
+start_or_reuse X11VNC_PID   "x11vnc"   "x11vnc -display $DISPLAY -rfbport $VNC_PORT"   "$RUNTIME_DIR/x11vnc.log"   x11vnc -display "$DISPLAY" -rfbport "$VNC_PORT" -localhost -forever -shared -nopw
 
-websockify --web=/usr/share/novnc 127.0.0.1:"$NOVNC_PORT" localhost:"$VNC_PORT" >"$RUNTIME_DIR/websockify.log" 2>&1 &
-WEBSOCKIFY_PID=$!
-sleep 1
+start_or_reuse WEBSOCKIFY_PID   "websockify"   "websockify --web=/usr/share/novnc 127.0.0.1:$NOVNC_PORT localhost:$VNC_PORT"   "$RUNTIME_DIR/websockify.log"   websockify --web=/usr/share/novnc 127.0.0.1:"$NOVNC_PORT" localhost:"$VNC_PORT"
 
 cat <<EOF
 noVNC URL: http://127.0.0.1:${NOVNC_PORT}/vnc.html?host=127.0.0.1&port=${NOVNC_PORT}

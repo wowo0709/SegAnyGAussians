@@ -42,6 +42,11 @@ class ParamGroup:
         for arg in vars(args).items():
             if arg[0] in vars(self) or ("_" + arg[0]) in vars(self):
                 setattr(group, arg[0], arg[1])
+
+        for key, value in vars(self).items():
+            target_key = key[1:] if key.startswith("_") else key
+            if not hasattr(group, target_key):
+                setattr(group, target_key, value)
         return group
 
 class ModelParams(ParamGroup): 
@@ -52,11 +57,15 @@ class ModelParams(ParamGroup):
         self._source_path = ""
         self._model_path = ""
         self._feature_model_path = ""
+        self.exp_name = ""
         self._images = "images"
         self._resolution = -1
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
+        self.gaussian_backend = "auto"
+        self.init_radius_scale = 0.5
+        self.init_min_radius = 0.05
 
         self.need_features = False
         self.need_masks = False
@@ -67,6 +76,29 @@ class ModelParams(ParamGroup):
     def extract(self, args):
         g = super().extract(args)
         g.source_path = os.path.abspath(g.source_path)
+        if getattr(g, "model_path", ""):
+            g.model_path = os.path.abspath(g.model_path)
+            feature_model_path = getattr(g, "feature_model_path", "")
+            if feature_model_path:
+                g.feature_model_path = os.path.abspath(feature_model_path)
+            elif getattr(g, "exp_name", ""):
+                exp_name = os.path.normpath(g.exp_name)
+                if os.path.isabs(exp_name) or exp_name.startswith(".."):
+                    raise ValueError(f"exp_name must be a relative subdirectory under model_path, got: {g.exp_name}")
+                g.feature_model_path = os.path.join(g.model_path, exp_name)
+            else:
+                feature_model_path_hint = os.path.join(g.model_path, "feature_model_path.txt")
+                hinted_path = ""
+                if os.path.isfile(feature_model_path_hint):
+                    try:
+                        with open(feature_model_path_hint, "r", encoding="utf-8") as handle:
+                            hinted_path = handle.read().strip()
+                    except OSError:
+                        hinted_path = ""
+                if hinted_path:
+                    g.feature_model_path = os.path.abspath(hinted_path)
+                else:
+                    g.feature_model_path = g.model_path
         return g
 
 class PipelineParams(ParamGroup):
@@ -110,6 +142,25 @@ class OptimizationParams(ParamGroup):
         self.smooth_K = 16
         self.scale_aware_dim = -1
         self.rfn = 1.
+        self.graph_laplacian_weight = 0.0
+        self.graph_laplacian_samples = 8192
+        self.graph_laplacian_scales = 2
+        self.graph_laplacian_k = -1
+        self.graph_spatial_weight = 1.0
+        self.graph_sh0_color_weight = 0.0
+        self.graph_sh0_color_sigma = 0.25
+        self.boundary_negative_weight = 0.0
+        self.boundary_negative_margin = 0.15
+        self.boundary_band_kernel = 5
+        self.supervision_mode = "multiscale"
+        self.multiscale_positive_dilate_kernel = 0
+        self.mask_scale_target = 0.5
+        self.mask_scale_tolerance = 0.1
+        self.mask_min_area = 256
+        self.mask_max_area_ratio = 0.5
+        self.mask_max_iou_overlap = 0.8
+        self.mask_boundary_erode_kernel = 3
+        self.min_valid_masks_per_view = 2
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser, target_cfg_file = None):

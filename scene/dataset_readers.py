@@ -40,6 +40,9 @@ class CameraInfo(NamedTuple):
     height: int
     cx: float = None
     cy: float = None
+    features_path: str = None
+    masks_path: str = None
+    mask_scales_path: str = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -109,12 +112,17 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, features_fo
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
 
-        features = torch.load(os.path.join(features_folder, image_name.split('.')[0] + ".pt")) if features_folder is not None else None
-        masks = torch.load(os.path.join(masks_folder, image_name.split('.')[0] + ".pt")) if masks_folder is not None else None
-        mask_scales = torch.load(os.path.join(mask_scale_folder, image_name.split('.')[0] + ".pt")) if mask_scale_folder is not None else None
+        features_path = os.path.join(features_folder, image_name.split('.')[0] + ".pt") if features_folder is not None else None
+        masks_path = os.path.join(masks_folder, image_name.split('.')[0] + ".pt") if masks_folder is not None else None
+        mask_scales_path = os.path.join(mask_scale_folder, image_name.split('.')[0] + ".pt") if mask_scale_folder is not None else None
+
+        features = torch.load(features_path, map_location='cpu') if features_path is not None else None
+        masks = None
+        mask_scales = torch.load(mask_scales_path, map_location='cpu') if mask_scales_path is not None else None
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image, features=features, masks=masks, mask_scales = mask_scales,
-                              image_path=image_path, image_name=image_name, width=width, height=height, cx=intr.params[2] if len(intr.params) > 3 and allow_principle_point_shift else None, cy=intr.params[3] if len(intr.params) >3 and allow_principle_point_shift else None)
+                              image_path=image_path, image_name=image_name, width=width, height=height, cx=intr.params[2] if len(intr.params) > 3 and allow_principle_point_shift else None, cy=intr.params[3] if len(intr.params) >3 and allow_principle_point_shift else None,
+                              features_path=features_path, masks_path=masks_path, mask_scales_path=mask_scales_path)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -145,6 +153,22 @@ def storePly(path, xyz, rgb):
     vertex_element = PlyElement.describe(elements, 'vertex')
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
+
+def createRandomPointCloudFromCameraHull(train_cam_infos, num_pts=100_000, radius_scale=1.0, min_radius=0.05):
+    cam_centers = []
+    for cam in train_cam_infos:
+        world_to_view = getWorld2View2(cam.R, cam.T)
+        cam_to_world = np.linalg.inv(world_to_view)
+        cam_centers.append(cam_to_world[:3, 3])
+
+    cam_centers = np.stack(cam_centers, axis=0)
+    center = cam_centers.mean(axis=0)
+    base_radius = np.linalg.norm(cam_centers - center, axis=1).max()
+    init_radius = max(base_radius * radius_scale, min_radius)
+
+    xyz = (np.random.random((num_pts, 3)) * 2.0 - 1.0) * init_radius + center
+    shs = np.random.random((num_pts, 3)) / 255.0
+    return xyz, SH2RGB(shs) * 255
 
 def readColmapSceneInfo(path, images, eval, llffhold=8, need_features=False, need_masks=False, sample_rate = 1.0, allow_principle_point_shift = False, replica=False):
     try:
@@ -306,7 +330,7 @@ def readCamerasFromLerfTransforms(path, transformsfile, white_background, extens
 
     return cam_infos
 
-def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
+def readNerfSyntheticInfo(path, white_background, eval, extension=".png", init_radius_scale=1.0, init_min_radius=0.05):
     print("Reading Training Transforms")
     train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
     print("Reading Test Transforms")
@@ -322,20 +346,9 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
     if not os.path.exists(ply_path):
         num_pts = 100_000
         print(f"Generating random point cloud ({num_pts})...")
-
-        cam_centers = []
-        for cam in train_cam_infos:
-            world_to_view = getWorld2View2(cam.R, cam.T)
-            cam_to_world = np.linalg.inv(world_to_view)
-            cam_centers.append(cam_to_world[:3, 3])
-        cam_centers = np.stack(cam_centers, axis=0)
-        center = cam_centers.mean(axis=0)
-        radius = np.linalg.norm(cam_centers - center, axis=1).max()
-        radius = max(radius, 1.0)
-
-        xyz = (np.random.random((num_pts, 3)) * 2.0 - 1.0) * radius + center
-        shs = np.random.random((num_pts, 3)) / 255.0
-        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+        xyz, rgb = createRandomPointCloudFromCameraHull(train_cam_infos, num_pts=num_pts, radius_scale=init_radius_scale, min_radius=init_min_radius)
+        print(f"Random init radius scale: {init_radius_scale}, min radius: {init_min_radius}")
+        storePly(ply_path, xyz, rgb)
     try:
         pcd = fetchPly(ply_path)
     except:
@@ -348,7 +361,7 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
-def readLerfInfo(path, white_background, eval, extension=".jpg"):
+def readLerfInfo(path, white_background, eval, extension=".jpg", init_radius_scale=1.0, init_min_radius=0.05):
     print("Reading Training Transforms")
     train_cam_infos = readCamerasFromLerfTransforms(path, "transforms.json", white_background, extension)
     test_cam_infos = []
@@ -362,20 +375,9 @@ def readLerfInfo(path, white_background, eval, extension=".jpg"):
     if not os.path.exists(ply_path):
         num_pts = 100_000
         print(f"Generating random point cloud ({num_pts})...")
-
-        cam_centers = []
-        for cam in train_cam_infos:
-            world_to_view = getWorld2View2(cam.R, cam.T)
-            cam_to_world = np.linalg.inv(world_to_view)
-            cam_centers.append(cam_to_world[:3, 3])
-        cam_centers = np.stack(cam_centers, axis=0)
-        center = cam_centers.mean(axis=0)
-        radius = np.linalg.norm(cam_centers - center, axis=1).max()
-        radius = max(radius, 1.0)
-
-        xyz = (np.random.random((num_pts, 3)) * 2.0 - 1.0) * radius + center
-        shs = np.random.random((num_pts, 3)) / 255.0
-        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+        xyz, rgb = createRandomPointCloudFromCameraHull(train_cam_infos, num_pts=num_pts, radius_scale=init_radius_scale, min_radius=init_min_radius)
+        print(f"Random init radius scale: {init_radius_scale}, min radius: {init_min_radius}")
+        storePly(ply_path, xyz, rgb)
     try:
         pcd = fetchPly(ply_path)
     except:
