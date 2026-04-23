@@ -1,8 +1,10 @@
 # Borrowed from OmniSeg3D-GS (https://github.com/OceanYing/OmniSeg3D-GS)
+import json
 import torch
 from scene import Scene
 import hashlib
 import os
+from collections import Counter
 from tqdm import tqdm
 from os import makedirs
 from gaussian_renderer import render, render_contrastive_feature
@@ -40,6 +42,17 @@ from utils.gaussian_graph_cluster import (
     load_mesh_prior_for_points,
 )
 from utils.sh_utils import SH2RGB
+
+
+CLUSTER_SOURCE_FEATURE = "feature"
+CLUSTER_SOURCE_EXTERNAL = "external"
+CLUSTER_SOURCE_PLY_LABEL = "ply_label"
+CLUSTER_SOURCE_GUI_TO_KEY = {
+    "Feature Recluster": CLUSTER_SOURCE_FEATURE,
+    "External Assignment": CLUSTER_SOURCE_EXTERNAL,
+    "Embedded PLY Label": CLUSTER_SOURCE_PLY_LABEL,
+}
+CLUSTER_SOURCE_KEY_TO_GUI = {value: key for key, value in CLUSTER_SOURCE_GUI_TO_KEY.items()}
 
 def depth2img(depth):
     depth = (depth-depth.min())/(depth.max()-depth.min() + 1e-7)
@@ -80,6 +93,10 @@ class CONFIG:
     SCENE_PCD_PATH = os.path.join(MODEL_PATH, f'point_cloud/iteration_{str(SCENE_GAUSSIAN_ITERATION)}/scene_point_cloud.ply')
 
     CLUSTER_METHOD = "HDBSCANRefined"
+    CLUSTER_SOURCE = CLUSTER_SOURCE_FEATURE
+    CLUSTER_ASSIGNMENT_PATH = ""
+    CLUSTER_ASSIGNMENT_RESOLUTION = 64
+    CLUSTER_ASSIGNMENT_XYZ_TOL = 1e-4
     HIDE_SMALL_RESIDUE = True
     RESIDUE_SCOPE = "Both"
     CUBOID_PERCENTILE = 100.0
@@ -248,6 +265,111 @@ def _candidate_feature_model_paths(model_path, feature_model_path=""):
     return roots
 
 
+def _is_scene_model_root(model_path):
+    point_cloud_root = os.path.join(os.path.abspath(model_path), "point_cloud")
+    if not os.path.isdir(point_cloud_root):
+        return False
+    for iteration in _list_available_iterations(point_cloud_root):
+        iteration_root = os.path.join(point_cloud_root, f"iteration_{iteration}")
+        for filename in ("scene_point_cloud.ply", "point_cloud.ply"):
+            if os.path.exists(os.path.join(iteration_root, filename)):
+                return True
+    return False
+
+
+def _discover_scene_model_instances(model_path):
+    model_path = os.path.abspath(model_path)
+    if _is_scene_model_root(model_path):
+        return [model_path]
+    if not os.path.isdir(model_path):
+        return []
+
+    discovered = []
+    for entry in sorted(os.listdir(model_path)):
+        child_path = os.path.join(model_path, entry)
+        if os.path.isdir(child_path) and _is_scene_model_root(child_path):
+            discovered.append(os.path.abspath(child_path))
+    return discovered
+
+
+def _resolve_feature_model_request_for_instance(opt, instance_root):
+    requested_feature_model_path = str(getattr(opt, "REQUESTED_FEATURE_MODEL_PATH", "") or "").strip()
+    requested_exp_name = str(getattr(opt, "REQUESTED_EXP_NAME", "") or "").strip()
+    instance_root = os.path.abspath(instance_root)
+
+    if requested_feature_model_path:
+        feature_root = os.path.abspath(requested_feature_model_path)
+        child_candidate = os.path.join(feature_root, os.path.basename(instance_root))
+        if os.path.isdir(child_candidate):
+            return child_candidate
+        return feature_root
+
+    if requested_exp_name:
+        return os.path.join(instance_root, requested_exp_name)
+
+    return ""
+
+
+def _resolve_model_artifact_bundle(requested_model_path, requested_feature_model_path, scene_iteration, feature_iteration, cluster_source):
+    requested_model_path = os.path.abspath(requested_model_path)
+    requested_feature_model_path = os.path.abspath(requested_feature_model_path) if requested_feature_model_path else ""
+
+    scene_root, resolved_scene_iteration, scene_pcd_path = _resolve_scene_bundle(
+        requested_model_path,
+        requested_iteration=scene_iteration,
+        feature_model_path=requested_feature_model_path,
+    )
+    feature_search_root = requested_feature_model_path or requested_model_path
+    feature_root = scene_root
+    resolved_feature_iteration = resolved_scene_iteration
+    feature_pcd_path = ""
+    scale_gate_path = ""
+    try:
+        feature_root, resolved_feature_iteration, feature_pcd_path, scale_gate_path = _resolve_feature_bundle(
+            scene_root,
+            requested_iteration=feature_iteration,
+            feature_model_path=feature_search_root,
+        )
+    except FileNotFoundError:
+        if cluster_source not in {CLUSTER_SOURCE_EXTERNAL, CLUSTER_SOURCE_PLY_LABEL}:
+            raise
+        print("Feature bundle not found; label/external cluster mode will use scene-geometry fallback features.")
+
+    return {
+        "scene_root": scene_root,
+        "scene_iteration": resolved_scene_iteration,
+        "scene_pcd_path": scene_pcd_path,
+        "feature_root": feature_root,
+        "feature_iteration": resolved_feature_iteration,
+        "feature_pcd_path": feature_pcd_path,
+        "scale_gate_path": scale_gate_path,
+    }
+
+
+def _apply_resolved_model_artifact_bundle(opt, bundle):
+    opt.MODEL_PATH = bundle["scene_root"]
+    opt.SCENE_GAUSSIAN_ITERATION = bundle["scene_iteration"]
+    opt.FEATURE_GAUSSIAN_ITERATION = bundle["feature_iteration"]
+    opt.FEATURE_MODEL_PATH = bundle["feature_root"]
+    opt.SCENE_PCD_PATH = bundle["scene_pcd_path"]
+    opt.FEATURE_PCD_PATH = bundle["feature_pcd_path"]
+    opt.SCALE_GATE_PATH = bundle["scale_gate_path"]
+
+
+def _initialize_model_browser(opt):
+    requested_model_path = os.path.abspath(str(getattr(opt, "REQUESTED_MODEL_PATH", opt.MODEL_PATH)))
+    discovered_instances = _discover_scene_model_instances(requested_model_path)
+    requested_is_instance_root = _is_scene_model_root(requested_model_path)
+
+    if len(discovered_instances) == 0:
+        discovered_instances = [requested_model_path]
+
+    opt.MODEL_BROWSER_ROOT = requested_model_path
+    opt.MODEL_BROWSER_ENABLED = (not requested_is_instance_root) and len(discovered_instances) > 0
+    opt.MODEL_BROWSER_INSTANCES = discovered_instances
+    opt.MODEL_BROWSER_SELECTED_INSTANCE = discovered_instances[0]
+
+
 def _resolve_feature_bundle(model_path, requested_iteration=None, feature_model_path=""):
     checked_pairs = []
     for feature_root in _candidate_feature_model_paths(model_path, feature_model_path):
@@ -273,34 +395,30 @@ def _resolve_feature_bundle(model_path, requested_iteration=None, feature_model_
 
 
 def _resolve_model_artifacts(opt):
-    requested_model_path = os.path.abspath(opt.MODEL_PATH)
-    requested_feature_model_path = os.path.abspath(opt.FEATURE_MODEL_PATH) if getattr(opt, "FEATURE_MODEL_PATH", "") else ""
-
-    scene_root, scene_iteration, scene_pcd_path = _resolve_scene_bundle(
-        requested_model_path,
-        requested_iteration=opt.SCENE_GAUSSIAN_ITERATION,
-        feature_model_path=requested_feature_model_path,
+    bundle = _resolve_model_artifact_bundle(
+        opt.MODEL_PATH,
+        getattr(opt, "FEATURE_MODEL_PATH", ""),
+        opt.SCENE_GAUSSIAN_ITERATION,
+        opt.FEATURE_GAUSSIAN_ITERATION,
+        getattr(opt, "CLUSTER_SOURCE", CLUSTER_SOURCE_FEATURE),
     )
-    feature_search_root = requested_feature_model_path or requested_model_path
-    feature_root, feature_iteration, feature_pcd_path, scale_gate_path = _resolve_feature_bundle(
-        scene_root,
-        requested_iteration=opt.FEATURE_GAUSSIAN_ITERATION,
-        feature_model_path=feature_search_root,
-    )
+    _apply_resolved_model_artifact_bundle(opt, bundle)
 
-    opt.MODEL_PATH = scene_root
-    opt.SCENE_GAUSSIAN_ITERATION = scene_iteration
-    opt.FEATURE_GAUSSIAN_ITERATION = feature_iteration
-    opt.FEATURE_MODEL_PATH = feature_root
-    opt.SCENE_PCD_PATH = scene_pcd_path
-    opt.FEATURE_PCD_PATH = feature_pcd_path
-    opt.SCALE_GATE_PATH = scale_gate_path
+    print(f"Resolved scene root: {bundle['scene_root']}")
+    print(f"Using scene iteration {bundle['scene_iteration']}: {bundle['scene_pcd_path']}")
+    if bundle["feature_pcd_path"]:
+        print(f"Using feature root: {bundle['feature_root']}")
+        print(f"Using feature iteration {bundle['feature_iteration']}: {bundle['feature_pcd_path']}")
+        print(f"Using scale gate: {bundle['scale_gate_path']}")
+    else:
+        print(f"Using feature fallback from scene root: {bundle['scene_root']}")
 
-    print(f"Resolved scene root: {scene_root}")
-    print(f"Using scene iteration {scene_iteration}: {scene_pcd_path}")
-    print(f"Using feature root: {feature_root}")
-    print(f"Using feature iteration {feature_iteration}: {feature_pcd_path}")
-    print(f"Using scale gate: {scale_gate_path}")
+
+def _configure_identity_scale_gate(scale_gate):
+    with torch.no_grad():
+        scale_gate[0].weight.zero_()
+        scale_gate[0].bias.fill_(12.0)
+    scale_gate.eval()
 
 
 def _load_scale_gate_state_dict(path):
@@ -450,6 +568,12 @@ class GaussianSplattingGUI:
 
         self.cluster_point_colors = None
         self.cluster_method = getattr(opt, "CLUSTER_METHOD", "HDBSCANRefined")
+        self.cluster_source = str(getattr(opt, "CLUSTER_SOURCE", CLUSTER_SOURCE_FEATURE)).strip().lower()
+        if self.cluster_source not in {CLUSTER_SOURCE_FEATURE, CLUSTER_SOURCE_EXTERNAL, CLUSTER_SOURCE_PLY_LABEL}:
+            self.cluster_source = CLUSTER_SOURCE_FEATURE
+        self.cluster_assignment_path = str(getattr(opt, "CLUSTER_ASSIGNMENT_PATH", "") or "").strip()
+        self.cluster_assignment_resolution = int(getattr(opt, "CLUSTER_ASSIGNMENT_RESOLUTION", 64))
+        self.cluster_assignment_xyz_tol = float(getattr(opt, "CLUSTER_ASSIGNMENT_XYZ_TOL", 1e-4))
         self.cluster_sample_size = int(getattr(opt, "CLUSTER_SAMPLE_SIZE", 20000))
         self.cluster_graph_k = int(getattr(opt, "CLUSTER_GRAPH_K", 16))
         self.cluster_max_clusters = int(getattr(opt, "CLUSTER_MAX_CLUSTERS", 24))
@@ -461,21 +585,40 @@ class GaussianSplattingGUI:
         self.cluster_mesh_weight = float(getattr(opt, "CLUSTER_MESH_WEIGHT", 0.0))
         self.cluster_mesh_path = getattr(opt, "CLUSTER_MESH_PATH", None)
         self.hide_small_residue = bool(getattr(opt, "HIDE_SMALL_RESIDUE", True))
+        self.hide_unassigned_gaussians = False
         self.residue_max_size = int(getattr(opt, "RESIDUE_MAX_SIZE", 1000))
         self.residue_scope = str(getattr(opt, "RESIDUE_SCOPE", "Both"))
         self.exclude_residue_on_active_export = bool(getattr(opt, "EXCLUDE_RESIDUE_ON_ACTIVE_EXPORT", True))
         self.cluster_mesh_prior = None
+        self.external_assignment_metadata = None
+        self.external_assignment_npz_path = None
+        self.external_assignment_json_path = None
+        self.embedded_label_field = None
+        self.embedded_label_source_path = None
         self.label_to_color = np.random.rand(1000, 3)
         self.label_to_code = self._generate_label_codes(1000)
         self.seg_score = None
+        self.using_feature_fallback = False
+        self.instance_roots = [os.path.abspath(path) for path in getattr(opt, "MODEL_BROWSER_INSTANCES", [opt.MODEL_PATH])]
+        if len(self.instance_roots) == 0:
+            self.instance_roots = [os.path.abspath(opt.MODEL_PATH)]
+        self.instance_root_by_name = {os.path.basename(path): path for path in self.instance_roots}
+        self.instance_names = list(self.instance_root_by_name.keys())
+        self.instance_browser_enabled = bool(getattr(opt, "MODEL_BROWSER_ENABLED", False))
+        self.current_instance_root = os.path.abspath(getattr(opt, "MODEL_BROWSER_SELECTED_INSTANCE", opt.MODEL_PATH))
+        self.current_instance_name = os.path.basename(self.current_instance_root)
+        self.instance_switch_requested = None
+        self.import_instance_requested = None
+        self.import_popup_candidate_roots = []
+        self.import_popup_root_by_label = {}
+        self.import_popup_selected_label = None
+        self.staged_import = None
 
         self.proj_mat = None
 
         self.load_model = False
         print("loading model file...")
-        self.engine['scene'].load_ply(self.opt.SCENE_PCD_PATH)
-        self.engine['feature'].load_ply(self.opt.FEATURE_PCD_PATH)
-        self.engine['scale_gate'].load_state_dict(_load_scale_gate_state_dict(self.opt.SCALE_GATE_PATH))
+        self._load_scene_and_feature_artifacts()
         self._validate_scene_feature_alignment(context="initial load")
         self.do_pca()   # calculate self.proj_mat
         self.load_model = True
@@ -599,6 +742,638 @@ class GaussianSplattingGUI:
     def __del__(self):
         dpg.destroy_context()
 
+    def _load_scene_and_feature_artifacts(self):
+        self.engine['scene'].load_ply(self.opt.SCENE_PCD_PATH)
+        if self.opt.FEATURE_PCD_PATH and os.path.exists(self.opt.FEATURE_PCD_PATH):
+            self.engine['feature'].load_ply(self.opt.FEATURE_PCD_PATH)
+            if self.opt.SCALE_GATE_PATH and os.path.exists(self.opt.SCALE_GATE_PATH):
+                self.engine['scale_gate'].load_state_dict(_load_scale_gate_state_dict(self.opt.SCALE_GATE_PATH))
+                self.engine['scale_gate'].eval()
+            else:
+                _configure_identity_scale_gate(self.engine['scale_gate'])
+            self.using_feature_fallback = False
+            return
+
+        if self.cluster_source in {CLUSTER_SOURCE_EXTERNAL, CLUSTER_SOURCE_PLY_LABEL}:
+            self.engine['feature'].load_ply_from_3dgs(self.opt.SCENE_PCD_PATH)
+            _configure_identity_scale_gate(self.engine['scale_gate'])
+            self.using_feature_fallback = True
+            print("Loaded label/external-cluster fallback feature model from scene gaussians.")
+            return
+
+        raise FileNotFoundError(
+            "Feature point cloud was not found, and fallback is only enabled for external or embedded-label cluster mode. "
+            f"Expected feature PLY at: {self.opt.FEATURE_PCD_PATH}"
+        )
+
+    def _cluster_source_status_label(self):
+        if self.cluster_source == CLUSTER_SOURCE_EXTERNAL:
+            return "ExternalAssignment"
+        if self.cluster_source == CLUSTER_SOURCE_PLY_LABEL:
+            return "EmbeddedPlyLabel"
+        return self.cluster_method
+
+    def _staged_import_active(self):
+        return self.staged_import is not None
+
+    def _current_scale_value(self):
+        if dpg.does_item_exist("_Scale"):
+            return float(dpg.get_value("_Scale"))
+        if self.last_scale_value is not None:
+            return float(self.last_scale_value)
+        return 0.0
+
+    def _current_instance_display_name(self):
+        if self.current_instance_name:
+            return self.current_instance_name
+        return os.path.basename(os.path.abspath(self.opt.MODEL_PATH))
+
+    def _discover_importable_instance_roots(self):
+        current_root = os.path.abspath(self.current_instance_root)
+        if self.instance_browser_enabled and len(self.instance_roots) > 1:
+            candidates = [os.path.abspath(path) for path in self.instance_roots]
+        else:
+            parent_root = os.path.dirname(current_root)
+            candidates = _discover_scene_model_instances(parent_root)
+        deduped = []
+        seen = set()
+        for candidate in candidates:
+            candidate = os.path.abspath(candidate)
+            if candidate == current_root or candidate in seen:
+                continue
+            seen.add(candidate)
+            deduped.append(candidate)
+        return deduped
+
+    def _label_import_candidates(self, candidate_roots):
+        counts = Counter(os.path.basename(path) or path for path in candidate_roots)
+        labeled = []
+        for root in candidate_roots:
+            base = os.path.basename(root) or root
+            label = base if counts[base] == 1 else f"{base} | {os.path.basename(os.path.dirname(root))}"
+            labeled.append((label, root))
+        return labeled
+
+    def _close_import_instance_popup(self, clear_candidates=False):
+        if dpg.does_item_exist("_ImportInstancePopup"):
+            dpg.hide_item("_ImportInstancePopup")
+        if dpg.does_item_exist("_ImportInstanceList"):
+            dpg.configure_item("_ImportInstanceList", items=tuple())
+            dpg.set_value("_ImportInstanceList", "")
+        if dpg.does_item_exist("_ImportInstanceSelected"):
+            dpg.set_value("_ImportInstanceSelected", "Selected: none")
+        if dpg.does_item_exist("_ImportInstanceError"):
+            dpg.set_value("_ImportInstanceError", "")
+        if dpg.does_item_exist("_ImportInstanceOkButton"):
+            dpg.configure_item("_ImportInstanceOkButton", enabled=False)
+        self.import_popup_selected_label = None
+        if clear_candidates:
+            self.import_popup_candidate_roots = []
+            self.import_popup_root_by_label = {}
+
+    def _open_import_instance_popup(self):
+        if self._staged_import_active():
+            self._set_cluster_status("finish or cancel the staged import before importing another instance")
+            return
+        if self.cluster_cache is None or self.cluster_cache_state != "ready":
+            self._set_cluster_status("import instance: cluster cache is not ready")
+            return
+        candidate_roots = self._discover_importable_instance_roots()
+        if len(candidate_roots) == 0:
+            self._set_cluster_status("import instance: no importable sibling instances found")
+            return
+        labeled_candidates = self._label_import_candidates(candidate_roots)
+        self.import_popup_candidate_roots = [root for _, root in labeled_candidates]
+        self.import_popup_root_by_label = {label: root for label, root in labeled_candidates}
+        self.import_popup_selected_label = labeled_candidates[0][0]
+        if dpg.does_item_exist("_ImportInstanceList"):
+            dpg.configure_item("_ImportInstanceList", items=tuple(label for label, _ in labeled_candidates))
+            dpg.set_value("_ImportInstanceList", self.import_popup_selected_label)
+        if dpg.does_item_exist("_ImportInstanceSelected"):
+            dpg.set_value("_ImportInstanceSelected", f"Selected: {self.import_popup_selected_label}")
+        if dpg.does_item_exist("_ImportInstanceError"):
+            dpg.set_value("_ImportInstanceError", "")
+        if dpg.does_item_exist("_ImportInstanceOkButton"):
+            dpg.configure_item("_ImportInstanceOkButton", enabled=True)
+        if dpg.does_item_exist("_ImportInstancePopup"):
+            viewport_width = int(dpg.get_viewport_client_width()) if dpg.is_viewport_ok() else int(self.window_width + 320)
+            viewport_height = int(dpg.get_viewport_client_height()) if dpg.is_viewport_ok() else int(self.window_height)
+            popup_width = 420
+            popup_height = 360
+            popup_x = max(20, int((viewport_width - popup_width) * 0.5))
+            popup_y = max(20, int((viewport_height - popup_height) * 0.5))
+            dpg.set_item_pos("_ImportInstancePopup", [popup_x, popup_y])
+            dpg.show_item("_ImportInstancePopup")
+            if dpg.does_item_exist("_ImportInstanceList"):
+                dpg.focus_item("_ImportInstanceList")
+            else:
+                dpg.focus_item("_ImportInstancePopup")
+        self._set_cluster_status(f"import popup opened: {len(labeled_candidates)} candidate instance(s)")
+
+    def _set_import_popup_selection(self, selected_label):
+        if selected_label not in self.import_popup_root_by_label:
+            self.import_popup_selected_label = None
+            if dpg.does_item_exist("_ImportInstanceSelected"):
+                dpg.set_value("_ImportInstanceSelected", "Selected: none")
+            if dpg.does_item_exist("_ImportInstanceOkButton"):
+                dpg.configure_item("_ImportInstanceOkButton", enabled=False)
+            return
+        self.import_popup_selected_label = selected_label
+        if dpg.does_item_exist("_ImportInstanceSelected"):
+            dpg.set_value("_ImportInstanceSelected", f"Selected: {selected_label}")
+        if dpg.does_item_exist("_ImportInstanceError"):
+            dpg.set_value("_ImportInstanceError", "")
+        if dpg.does_item_exist("_ImportInstanceOkButton"):
+            dpg.configure_item("_ImportInstanceOkButton", enabled=True)
+
+    def _cluster_cache_raw_labels_np(self):
+        if self.cluster_cache is None:
+            return None
+        raw_labels = self.cluster_cache.get("raw_labels")
+        if raw_labels is None:
+            raw_labels = self.cluster_cache.get("labels")
+        if raw_labels is None:
+            return None
+        return raw_labels.detach().cpu().numpy().astype(np.int64, copy=False)
+
+    def _dense_cluster_idx_from_raw_labels(self, raw_labels_np):
+        dense_labels, _, _ = self._densify_cluster_labels(raw_labels_np)
+        return dense_labels.astype(np.int32, copy=False)
+
+    def _cluster_idx_values_for_export(self, indices):
+        count = int(indices.shape[0])
+        if count <= 0:
+            return np.zeros((0,), dtype=np.int32)
+        raw_labels_np = self._cluster_cache_raw_labels_np()
+        if raw_labels_np is None:
+            return np.full((count,), -1, dtype=np.int32)
+        index_np = indices.detach().cpu().numpy().astype(np.int64, copy=False)
+        max_index = int(np.max(index_np)) if index_np.size > 0 else -1
+        if raw_labels_np.shape[0] <= max_index:
+            return np.full((count,), -1, dtype=np.int32)
+        return self._dense_cluster_idx_from_raw_labels(raw_labels_np[index_np])
+
+    def _make_single_block_import_assignment(self, count):
+        return np.zeros((count,), dtype=np.int64), np.ones((count,), dtype=np.float32)
+
+    def _remap_import_raw_labels(self, raw_labels_np, start_label):
+        raw_labels_np = np.asarray(raw_labels_np, dtype=np.int64).reshape(-1)
+        remapped = np.full(raw_labels_np.shape, -1, dtype=np.int64)
+        valid_labels = sorted(np.unique(raw_labels_np[raw_labels_np >= 0]).tolist())
+        for offset, source_label in enumerate(valid_labels):
+            remapped[raw_labels_np == int(source_label)] = int(start_label) + offset
+        return remapped
+
+    def _create_temporary_scale_gate(self):
+        return torch.nn.Sequential(
+            torch.nn.Linear(1, self.opt.FEATURE_DIM, bias=True),
+            torch.nn.Sigmoid()
+        ).cuda()
+
+    def _load_temporary_bundle_models(self, bundle):
+        temp_scene = GaussianModel(self.opt.sh_degree)
+        temp_feature = FeatureGaussianModel(self.opt.FEATURE_DIM)
+        temp_scale_gate = self._create_temporary_scale_gate()
+        temp_scene.load_ply(bundle["scene_pcd_path"])
+        if bundle["feature_pcd_path"] and os.path.exists(bundle["feature_pcd_path"]):
+            temp_feature.load_ply(bundle["feature_pcd_path"])
+            if bundle["scale_gate_path"] and os.path.exists(bundle["scale_gate_path"]):
+                temp_scale_gate.load_state_dict(_load_scale_gate_state_dict(bundle["scale_gate_path"]))
+                temp_scale_gate.eval()
+            else:
+                _configure_identity_scale_gate(temp_scale_gate)
+        else:
+            temp_feature.load_ply_from_3dgs(bundle["scene_pcd_path"])
+            _configure_identity_scale_gate(temp_scale_gate)
+        if int(temp_scene.get_xyz.shape[0]) != int(temp_feature.get_xyz.shape[0]):
+            raise RuntimeError(
+                f"Imported instance scene/feature Gaussian count mismatch: "
+                f"scene={int(temp_scene.get_xyz.shape[0])}, feature={int(temp_feature.get_xyz.shape[0])}."
+            )
+        return temp_scene, temp_feature, temp_scale_gate
+
+    def _resolve_external_assignment_paths_for_scene(self, scene_pcd_path, explicit_assignment_path=""):
+        if explicit_assignment_path:
+            npz_path = os.path.abspath(explicit_assignment_path)
+            if not os.path.isfile(npz_path):
+                raise FileNotFoundError(f"Explicit cluster assignment file does not exist: {npz_path}")
+        else:
+            scene_iteration_dir = os.path.dirname(scene_pcd_path)
+            npz_path = os.path.join(
+                scene_iteration_dir,
+                f"point_cloud_partsam_clusters_r{int(self.cluster_assignment_resolution)}.npz",
+            )
+            if not os.path.isfile(npz_path):
+                raise FileNotFoundError(
+                    f"Auto-discovered cluster assignment file was not found at: {npz_path}"
+                )
+        json_path = os.path.splitext(npz_path)[0] + ".json"
+        if not os.path.isfile(json_path):
+            json_path = None
+        return npz_path, json_path
+
+    def _load_external_assignment_for_scene(self, scene_pcd_path, scene_xyz_np, feature_count, explicit_assignment_path=""):
+        assignment_npz_path, assignment_json_path = self._resolve_external_assignment_paths_for_scene(
+            scene_pcd_path,
+            explicit_assignment_path=explicit_assignment_path,
+        )
+        with np.load(assignment_npz_path, allow_pickle=False) as payload:
+            if "cluster_index" not in payload.files:
+                raise RuntimeError(
+                    f"External assignment at {assignment_npz_path} is missing required array 'cluster_index'."
+                )
+            labels_np = np.asarray(payload["cluster_index"], dtype=np.int64).reshape(-1)
+            gaussian_xyz_np = None
+            if "gaussian_xyz" in payload.files:
+                gaussian_xyz_np = np.asarray(payload["gaussian_xyz"], dtype=np.float32)
+
+        scene_count = int(scene_xyz_np.shape[0])
+        if labels_np.shape[0] != scene_count or scene_count != int(feature_count):
+            raise RuntimeError(
+                f"External assignment count mismatch: labels={labels_np.shape[0]}, "
+                f"scene={scene_count}, feature={int(feature_count)}."
+            )
+
+        if gaussian_xyz_np is not None:
+            if gaussian_xyz_np.shape != scene_xyz_np.shape:
+                raise RuntimeError(
+                    f"External assignment gaussian_xyz shape mismatch: {gaussian_xyz_np.shape} vs {scene_xyz_np.shape}."
+                )
+            xyz_delta = float(np.max(np.abs(gaussian_xyz_np - scene_xyz_np))) if gaussian_xyz_np.size > 0 else 0.0
+            if xyz_delta > float(self.cluster_assignment_xyz_tol):
+                raise RuntimeError(
+                    f"External assignment xyz mismatch: max abs delta {xyz_delta:.6f} exceeds "
+                    f"tolerance {self.cluster_assignment_xyz_tol:.6f}."
+                )
+
+        confidence_np = np.where(labels_np >= 0, 1.0, 0.0).astype(np.float32, copy=False)
+        return labels_np, confidence_np, assignment_npz_path, assignment_json_path
+
+    def _load_embedded_ply_labels_for_scene(self, scene_pcd_path, expected_count):
+        plydata = PlyData.read(scene_pcd_path)
+        if len(plydata.elements) == 0:
+            raise RuntimeError(f"PLY file has no elements: {scene_pcd_path}")
+        ply_element = plydata.elements[0]
+        property_names = [prop.name for prop in ply_element.properties]
+        label_field = None
+        for candidate in ("cluster_idx", "cluster_index", "label"):
+            if candidate in property_names:
+                label_field = candidate
+                break
+        if label_field is None:
+            available = ", ".join(property_names[:24])
+            if len(property_names) > 24:
+                available += ", ..."
+            raise RuntimeError(
+                f"Embedded PLY label source requires one of [cluster_idx, cluster_index, label], "
+                f"but {scene_pcd_path} only has: {available}"
+            )
+        labels_np = np.asarray(ply_element[label_field], dtype=np.int64).reshape(-1)
+        if labels_np.shape[0] != int(expected_count):
+            raise RuntimeError(
+                f"Embedded PLY label count mismatch: labels={labels_np.shape[0]}, expected={int(expected_count)}."
+            )
+        confidence_np = np.where(labels_np >= 0, 1.0, 0.0).astype(np.float32, copy=False)
+        return labels_np, confidence_np, label_field
+
+    def _compute_feature_cluster_assignment_for_models(self, temp_scene, temp_feature, temp_scale_gate, scale, model_path):
+        point_features = temp_feature.get_point_features.detach()
+        normed_point_features = torch.nn.functional.normalize(point_features, dim=-1, p=2)
+        gates = temp_scale_gate(torch.tensor([scale], device=point_features.device)).detach().squeeze(0)
+        scale_conditioned = normed_point_features * gates.unsqueeze(0)
+        normed_conditioned = torch.nn.functional.normalize(scale_conditioned, dim=-1, p=2)
+
+        point_xyz = temp_scene.get_xyz.detach().cpu().numpy().astype(np.float32, copy=False)
+        point_features_np = normed_conditioned.detach().cpu().numpy().astype(np.float32, copy=False)
+        point_sh0_rgb_np = None
+        if self.cluster_sh0_color_weight > 0:
+            point_sh0_rgb = SH2RGB(temp_scene.get_features[:, 0, :].detach()).clamp(0.0, 1.0)
+            point_sh0_rgb_np = point_sh0_rgb.detach().cpu().numpy().astype(np.float32, copy=False)
+
+        mesh_prior = None
+        if self.cluster_mesh_weight > 0:
+            mesh_prior = load_mesh_prior_for_points(
+                point_xyz,
+                model_path=model_path,
+                mesh_path=self.cluster_mesh_path,
+            )
+
+        method_key = str(self.cluster_method).lower()
+        if method_key == "normalizedcut":
+            result = cluster_gaussians_normalized_cut(
+                point_xyz,
+                point_features_np,
+                sample_size=self.cluster_sample_size,
+                graph_k=self.cluster_graph_k,
+                propagation_k=max(8, min(self.cluster_graph_k, 32)),
+                max_clusters=self.cluster_max_clusters,
+                min_cluster_size=self.cluster_min_cluster_size,
+                cut_threshold=self.cluster_cut_threshold,
+                spatial_weight=self.cluster_spatial_weight,
+                sh0_rgb=point_sh0_rgb_np,
+                sh0_color_weight=self.cluster_sh0_color_weight,
+                sh0_color_sigma=self.cluster_sh0_color_sigma,
+                point_mesh_vertex_idx=None if mesh_prior is None else mesh_prior['point_mesh_vertex_idx'],
+                mesh_vertex_adjacency=None if mesh_prior is None else mesh_prior['mesh_vertex_adjacency'],
+                mesh_weight=self.cluster_mesh_weight,
+            )
+            return np.asarray(result["labels"], dtype=np.int64).reshape(-1), np.asarray(result["confidence"], dtype=np.float32).reshape(-1), "NormalizedCut"
+
+        if method_key == "hdbscanrefined":
+            result = cluster_gaussians_hdbscan_refined(
+                point_xyz,
+                point_features_np,
+                sample_size=self.cluster_sample_size,
+                hdbscan_min_cluster_size=10,
+                hdbscan_epsilon=0.01,
+                graph_k=self.cluster_graph_k,
+                min_cluster_size=self.cluster_min_cluster_size,
+                spatial_scale=2.5,
+                spatial_weight=self.cluster_spatial_weight,
+                sh0_rgb=point_sh0_rgb_np,
+                sh0_color_weight=self.cluster_sh0_color_weight,
+                sh0_color_sigma=self.cluster_sh0_color_sigma,
+                random_state=0,
+            )
+            return np.asarray(result["labels"], dtype=np.int64).reshape(-1), np.asarray(result["confidence"], dtype=np.float32).reshape(-1), "HDBSCANRefined"
+
+        result = cluster_gaussians_hdbscan(
+            point_features_np,
+            sample_size=self.cluster_sample_size,
+            hdbscan_min_cluster_size=10,
+            hdbscan_epsilon=0.01,
+            random_state=0,
+        )
+        return np.asarray(result["labels"], dtype=np.int64).reshape(-1), np.asarray(result["confidence"], dtype=np.float32).reshape(-1), "HDBSCAN"
+
+    def _resolve_import_subset_assignment(self, bundle, temp_scene, temp_feature, temp_scale_gate, scale):
+        scene_count = int(temp_scene.get_xyz.shape[0])
+        try:
+            if self.cluster_source == CLUSTER_SOURCE_EXTERNAL:
+                labels_np, confidence_np, _, _ = self._load_external_assignment_for_scene(
+                    bundle["scene_pcd_path"],
+                    temp_scene.get_xyz.detach().cpu().numpy().astype(np.float32, copy=False),
+                    int(temp_feature.get_xyz.shape[0]),
+                    explicit_assignment_path=self.cluster_assignment_path,
+                )
+                method = "ExternalAssignment"
+            elif self.cluster_source == CLUSTER_SOURCE_PLY_LABEL:
+                labels_np, confidence_np, _ = self._load_embedded_ply_labels_for_scene(
+                    bundle["scene_pcd_path"],
+                    scene_count,
+                )
+                method = "EmbeddedPlyLabel"
+            else:
+                labels_np, confidence_np, method = self._compute_feature_cluster_assignment_for_models(
+                    temp_scene,
+                    temp_feature,
+                    temp_scale_gate,
+                    scale,
+                    bundle["scene_root"],
+                )
+
+            labels_np = np.asarray(labels_np, dtype=np.int64).reshape(-1)
+            confidence_np = np.asarray(confidence_np, dtype=np.float32).reshape(-1)
+            if labels_np.shape[0] != scene_count or confidence_np.shape[0] != scene_count:
+                raise RuntimeError(
+                    f"Imported subset assignment size mismatch: labels={labels_np.shape[0]}, "
+                    f"confidence={confidence_np.shape[0]}, expected={scene_count}."
+                )
+            if np.any(labels_np < 0):
+                raise RuntimeError("Imported subset assignment left some gaussians unlabeled.")
+            if np.any(confidence_np < 0.999):
+                raise RuntimeError("Imported subset assignment produced low-confidence gaussians.")
+            return labels_np, np.ones((scene_count,), dtype=np.float32), method, None
+        except Exception as exc:
+            labels_np, confidence_np = self._make_single_block_import_assignment(scene_count)
+            return labels_np, confidence_np, "SingleBlock", str(exc)
+
+    def _build_parts_from_dense_cluster_subset(self, indices, source="import"):
+        indices = self._clip_indices_to_current_geometry(indices)
+        if indices is None or indices.numel() == 0 or self.cluster_cache is None:
+            return []
+        dense_labels = self.cluster_cache["labels"][indices]
+        unique_labels = torch.unique(dense_labels)
+        parts = []
+        for cluster_id in unique_labels.detach().cpu().tolist():
+            cluster_member_indices = indices[dense_labels == int(cluster_id)]
+            if cluster_member_indices.numel() == 0:
+                continue
+            part = self._build_part_from_component_indices(
+                int(cluster_id),
+                cluster_member_indices,
+                seed_index=int(cluster_member_indices[0].item()),
+                source=source,
+            )
+            if part is not None:
+                parts.append(part)
+        return parts
+
+    def _stage_import_instance(self, instance_root):
+        if self._staged_import_active():
+            self._set_cluster_status("finish or cancel the staged import before importing another instance")
+            return
+        if self.cluster_cache is None or self.cluster_cache_state != "ready":
+            self._set_cluster_status("import instance: cluster cache is not ready")
+            return
+
+        bundle = self._resolve_runtime_bundle_for_instance(instance_root)
+        scale = self._current_scale_value()
+        self._cancel_preview_for_selection_change()
+        self._clear_active_ui_state()
+        self._clear_cluster_selection()
+        pre_import_snapshot = self._capture_structural_snapshot()
+
+        try:
+            temp_scene, temp_feature, temp_scale_gate = self._load_temporary_bundle_models(bundle)
+            imported_count = int(temp_scene.get_xyz.shape[0])
+            if imported_count <= 0:
+                raise RuntimeError("imported instance has no gaussians")
+
+            import_raw_labels_local, import_confidence_np, assignment_method, assignment_error = self._resolve_import_subset_assignment(
+                bundle,
+                temp_scene,
+                temp_feature,
+                temp_scale_gate,
+                scale,
+            )
+            current_raw_labels = self._cluster_cache_raw_labels_np()
+            current_confidence = self.cluster_cache["confidence"].detach().cpu().numpy().astype(np.float32, copy=False)
+            if current_raw_labels is None:
+                current_raw_labels = self.cluster_cache["labels"].detach().cpu().numpy().astype(np.int64, copy=False)
+            max_raw_label = int(current_raw_labels[current_raw_labels >= 0].max()) if np.any(current_raw_labels >= 0) else -1
+            remapped_import_raw_labels = self._remap_import_raw_labels(import_raw_labels_local, max_raw_label + 1)
+
+            scene = self.engine['scene']
+            feature = self.engine['feature']
+            old_count = int(scene._xyz.shape[0])
+            scene.append_inference_tensors(
+                xyz=temp_scene._xyz.detach().clone(),
+                features_dc=temp_scene._features_dc.detach().clone(),
+                features_rest=temp_scene._features_rest.detach().clone(),
+                opacity=temp_scene._opacity.detach().clone(),
+                scaling=temp_scene._scaling.detach().clone(),
+                rotation=temp_scene._rotation.detach().clone(),
+            )
+            feature.append_inference_tensors(
+                xyz=temp_feature._xyz.detach().clone(),
+                point_features=temp_feature._point_features.detach().clone(),
+                opacity=temp_feature._opacity.detach().clone(),
+                scaling=temp_feature._scaling.detach().clone(),
+                rotation=temp_feature._rotation.detach().clone(),
+            )
+            self._validate_scene_feature_alignment(context="import instance")
+
+            merged_raw_labels = np.concatenate((current_raw_labels, remapped_import_raw_labels), axis=0)
+            merged_confidence = np.concatenate((current_confidence, import_confidence_np.astype(np.float32, copy=False)), axis=0)
+            self._rebuild_cluster_cache_after_structure(merged_raw_labels, merged_confidence)
+
+            imported_indices = torch.arange(old_count, old_count + imported_count, device=scene._xyz.device, dtype=torch.long)
+            imported_parts = self._build_parts_from_dense_cluster_subset(imported_indices, source="import")
+            if len(imported_parts) == 0:
+                raise RuntimeError("failed to create imported active selection")
+            self.show_active = True
+            self._clear_cluster_selection()
+            if not self._set_active_group_from_source_parts(
+                imported_parts,
+                success_status=f"staged import: {os.path.basename(bundle['scene_root'])} ({assignment_method})",
+                empty_status="import instance: imported selection became empty",
+                score_thres_override=0.0,
+            ):
+                raise RuntimeError("failed to build imported active cuboid")
+
+            self.staged_import = {
+                "pre_import_snapshot": pre_import_snapshot,
+                "imported_indices": imported_indices.detach().cpu().clone(),
+                "imported_raw_labels": remapped_import_raw_labels.copy(),
+                "cluster_source": self.cluster_source,
+                "assignment_method": assignment_method,
+                "source_instance_root": os.path.abspath(bundle["scene_root"]),
+            }
+            status_message = f"staged import: {os.path.basename(bundle['scene_root'])} ({assignment_method})"
+            if assignment_error:
+                status_message = f"staged import: {os.path.basename(bundle['scene_root'])} ({assignment_method} fallback: {assignment_error})"
+            self._set_cluster_status(status_message)
+        except Exception as exc:
+            self.staged_import = None
+            self._restore_structural_snapshot(pre_import_snapshot)
+            self._set_cluster_status(f"import instance failed: {exc}", state=self.cluster_cache_state)
+            raise
+
+    def _apply_staged_import(self):
+        if not self._staged_import_active():
+            return False
+        staged_import = self.staged_import
+        self._commit_active_group_if_dirty()
+        before_snapshot = staged_import["pre_import_snapshot"]
+        after_snapshot = self._capture_structural_snapshot()
+        self._push_apply_history(before_snapshot, after_snapshot, kind="structure")
+        imported_count = int(staged_import["imported_indices"].numel()) if staged_import.get("imported_indices") is not None else 0
+        self.staged_import = None
+        self._clear_active_ui_state()
+        self._clear_cluster_selection()
+        self._close_import_instance_popup(clear_candidates=True)
+        self._set_cluster_status(f"import applied: {imported_count} gaussians ({len(self.apply_undo_stack)} undo)")
+        return True
+
+    def _cancel_staged_import(self):
+        if not self._staged_import_active():
+            return False
+        snapshot = self.staged_import["pre_import_snapshot"]
+        self.staged_import = None
+        self._clear_active_ui_state()
+        self._clear_cluster_selection()
+        self._restore_structural_snapshot(snapshot)
+        self._close_import_instance_popup(clear_candidates=True)
+        self._set_cluster_status("staged import canceled")
+        return True
+
+    def _refresh_instance_selector_widget(self):
+        if not dpg.does_item_exist("_InstanceSelect"):
+            return
+        dpg.configure_item("_InstanceSelect", items=tuple(self.instance_names), enabled=len(self.instance_names) > 1)
+        if self.current_instance_name in self.instance_names:
+            dpg.set_value("_InstanceSelect", self.current_instance_name)
+
+    def _prepare_prompt_state_for_model_reload(self):
+        self.new_click = False
+        self.new_click_xy = []
+        self.prompt_num = 0
+        self.clear_edit = False
+        self.roll_back = False
+        self.segment3d_flag = False
+        self.cluster_in_3D_flag = False
+        self.chosen_feature = None
+
+    def _prepare_for_model_reload(self):
+        self._end_cuboid_drag()
+        if self._active_group_has_cuboid():
+            self._cancel_active_group()
+        self._clear_active_ui_state()
+        self._clear_cluster_selection()
+        self.staged_import = None
+        self.import_instance_requested = None
+        self._close_import_instance_popup(clear_candidates=True)
+        self._prepare_prompt_state_for_model_reload()
+        self.apply_undo_stack = []
+        self.apply_redo_stack = []
+        self.part_list_dirty = True
+        self.part_row_signature = None
+        self.recluster_requested = False
+        self.selection_debug_render = None
+        self.last_scene_outputs = None
+        self.last_feature_outputs = None
+        self.last_picked_cluster_id = None
+        self.last_picked_seed_index = None
+        self.last_pick_result = "none"
+        self.last_pick_confidence = None
+
+    def _reset_cluster_runtime_after_model_reload(self, reason):
+        self.cluster_request_generation += 1
+        self.component_cache = {}
+        self.cluster_cache = None
+        self.cluster_cache_scale = None
+        self.cluster_pending_result = None
+        self.cluster_job_error = None
+        self.cluster_thread = None
+        self.cluster_point_colors = None
+        self.cluster_mesh_prior = None
+        self.external_assignment_metadata = None
+        self.external_assignment_npz_path = None
+        self.external_assignment_json_path = None
+        self.embedded_label_field = None
+        self.embedded_label_source_path = None
+        self.seg_score = None
+        self.cluster_pick_feature_render = None
+        self.rendered_cluster = None
+        self._set_cluster_status(f"stale: {reason}", state="stale")
+
+    def _resolve_runtime_bundle_for_instance(self, instance_root):
+        feature_model_request = _resolve_feature_model_request_for_instance(self.opt, instance_root)
+        return _resolve_model_artifact_bundle(
+            instance_root,
+            feature_model_request,
+            getattr(self.opt, "REQUESTED_SCENE_GAUSSIAN_ITERATION", self.opt.SCENE_GAUSSIAN_ITERATION),
+            getattr(self.opt, "REQUESTED_FEATURE_GAUSSIAN_ITERATION", self.opt.FEATURE_GAUSSIAN_ITERATION),
+            self.cluster_source,
+        )
+
+    def _reload_instance_artifacts(self, instance_root, reason):
+        instance_root = os.path.abspath(instance_root)
+        bundle = self._resolve_runtime_bundle_for_instance(instance_root)
+        self.load_model = False
+        self._prepare_for_model_reload()
+        _apply_resolved_model_artifact_bundle(self.opt, bundle)
+        self._load_scene_and_feature_artifacts()
+        self._validate_scene_feature_alignment(context=reason)
+        self.do_pca()
+        self.current_instance_root = os.path.abspath(bundle["scene_root"])
+        self.current_instance_name = os.path.basename(self.current_instance_root)
+        self.opt.MODEL_BROWSER_SELECTED_INSTANCE = self.current_instance_root
+        self.load_model = True
+        self._reset_cluster_runtime_after_model_reload(reason)
+        self._refresh_instance_selector_widget()
+
     def prepare_buffer(self, outputs):
         if self.model == "images":
             return outputs["render"]
@@ -635,8 +1410,9 @@ class GaussianSplattingGUI:
 
 
     def _selection_cluster_ids(self):
-        if self._active_group_has_cuboid():
-            return sorted({int(part["cluster_id"]) for part in self.active_group.get("parts", [])})
+        active_group = self._get_active_group_if_ready()
+        if active_group is not None:
+            return sorted({int(part["cluster_id"]) for part in active_group.get("parts", [])})
         return sorted({int(part["cluster_id"]) for part in self.pending_parts})
 
     def _part_display_color(self, part_index, active=False):
@@ -655,10 +1431,390 @@ class GaussianSplattingGUI:
                 cloned[key] = value
         return cloned
 
+    def _current_structural_active_indices(self):
+        active_group = self._get_active_group_if_ready()
+        if active_group is None:
+            return None
+        visible_chunks = []
+        for part in active_group.get("parts", []):
+            indices = self._part_visible_indices(part, active=True)
+            if indices is not None and indices.numel() > 0:
+                visible_chunks.append(indices)
+        if len(visible_chunks) == 0:
+            return None
+        return torch.unique(torch.cat(visible_chunks, dim=0))
+
+    def _cluster_source_gui_value(self):
+        return CLUSTER_SOURCE_KEY_TO_GUI.get(self.cluster_source, CLUSTER_SOURCE_KEY_TO_GUI[CLUSTER_SOURCE_FEATURE])
+
+    def _set_cluster_source(self, source_value):
+        normalized = str(source_value).strip().lower()
+        if normalized not in {CLUSTER_SOURCE_FEATURE, CLUSTER_SOURCE_EXTERNAL, CLUSTER_SOURCE_PLY_LABEL}:
+            normalized = CLUSTER_SOURCE_FEATURE
+        self.cluster_source = normalized
+        self.opt.CLUSTER_SOURCE = normalized
+
+    def _resolve_external_assignment_paths(self):
+        if self.cluster_assignment_path:
+            npz_path = os.path.abspath(self.cluster_assignment_path)
+            if not os.path.isfile(npz_path):
+                raise FileNotFoundError(f"Explicit cluster assignment file does not exist: {npz_path}")
+        else:
+            scene_iteration_dir = os.path.dirname(self.opt.SCENE_PCD_PATH)
+            npz_path = os.path.join(
+                scene_iteration_dir,
+                f"point_cloud_partsam_clusters_r{int(self.cluster_assignment_resolution)}.npz",
+            )
+            if not os.path.isfile(npz_path):
+                raise FileNotFoundError(
+                    f"Auto-discovered cluster assignment file was not found at: {npz_path}"
+                )
+
+        json_path = os.path.splitext(npz_path)[0] + ".json"
+        if not os.path.isfile(json_path):
+            json_path = None
+        return npz_path, json_path
+
+    def _load_external_cluster_assignment(self, scale):
+        self._validate_scene_feature_alignment(context="external cluster import")
+
+        assignment_npz_path, assignment_json_path = self._resolve_external_assignment_paths()
+        with np.load(assignment_npz_path, allow_pickle=False) as payload:
+            if "cluster_index" not in payload.files:
+                raise RuntimeError(
+                    f"External assignment at {assignment_npz_path} is missing required array 'cluster_index'."
+                )
+            labels_np = np.asarray(payload["cluster_index"], dtype=np.int64).reshape(-1)
+            gaussian_xyz_np = None
+            if "gaussian_xyz" in payload.files:
+                gaussian_xyz_np = np.asarray(payload["gaussian_xyz"], dtype=np.float32)
+
+        scene_xyz = self.engine['scene'].get_xyz.detach().cpu().numpy().astype(np.float32, copy=False)
+        scene_count = int(scene_xyz.shape[0])
+        feature_count = int(self.engine['feature'].get_point_features.shape[0])
+        if labels_np.shape[0] != scene_count or scene_count != feature_count:
+            raise RuntimeError(
+                f"External assignment count mismatch: labels={labels_np.shape[0]}, "
+                f"scene={scene_count}, feature={feature_count}."
+            )
+
+        if gaussian_xyz_np is not None:
+            if gaussian_xyz_np.shape != scene_xyz.shape:
+                raise RuntimeError(
+                    f"External assignment gaussian_xyz shape mismatch: {gaussian_xyz_np.shape} vs {scene_xyz.shape}."
+                )
+            xyz_delta = float(np.max(np.abs(gaussian_xyz_np - scene_xyz))) if gaussian_xyz_np.size > 0 else 0.0
+            if xyz_delta > float(self.cluster_assignment_xyz_tol):
+                raise RuntimeError(
+                    f"External assignment xyz mismatch: max abs delta {xyz_delta:.6f} exceeds "
+                    f"tolerance {self.cluster_assignment_xyz_tol:.6f}."
+                )
+
+        metadata = None
+        if assignment_json_path is not None:
+            with open(assignment_json_path, "r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+
+        confidence_np = np.where(labels_np >= 0, 1.0, 0.0).astype(np.float32, copy=False)
+        self.cluster_request_generation += 1
+        self.cluster_pending_result = None
+        self.cluster_job_error = None
+        self.cluster_thread = None
+        self.cluster_cache = None
+        self.cluster_cache_scale = None
+        self.cluster_point_colors = None
+        self.cluster_mesh_prior = None
+        self.seg_score = None
+        self.component_cache = {}
+        self._clear_cluster_selection()
+
+        self.cluster_cache, self.cluster_point_colors = self._build_cluster_cache_from_arrays(
+            labels_np,
+            confidence_np,
+            scale=scale,
+            method="ExternalAssignment",
+        )
+        self.cluster_cache_scale = float(scale)
+        self.external_assignment_metadata = metadata
+        self.external_assignment_npz_path = assignment_npz_path
+        self.external_assignment_json_path = assignment_json_path
+        self._set_cluster_status(
+            f"ready: {self.cluster_cache['num_clusters']} ExternalAssignment clusters @ scale={float(scale):.3f}",
+            state="ready",
+        )
+        print(f"Loaded external cluster assignment from {assignment_npz_path}")
+        if assignment_json_path is not None:
+            print(f"Loaded external cluster metadata from {assignment_json_path}")
+
+    def _load_embedded_ply_cluster_assignment(self, scale):
+        self._validate_scene_feature_alignment(context="embedded PLY label import")
+
+        ply_path = self.opt.SCENE_PCD_PATH
+        plydata = PlyData.read(ply_path)
+        if len(plydata.elements) == 0:
+            raise RuntimeError(f"PLY file has no elements: {ply_path}")
+        ply_element = plydata.elements[0]
+        property_names = [prop.name for prop in ply_element.properties]
+
+        label_field = None
+        for candidate in ("cluster_idx", "cluster_index", "label"):
+            if candidate in property_names:
+                label_field = candidate
+                break
+
+        if label_field is None:
+            available = ", ".join(property_names[:24])
+            if len(property_names) > 24:
+                available += ", ..."
+            raise RuntimeError(
+                f"Embedded PLY label source requires one of [cluster_idx, cluster_index, label], "
+                f"but {ply_path} only has: {available}"
+            )
+
+        labels_np = np.asarray(ply_element[label_field], dtype=np.int64).reshape(-1)
+        scene_count = int(self.engine['scene'].get_xyz.shape[0])
+        feature_count = int(self.engine['feature'].get_point_features.shape[0])
+        if labels_np.shape[0] != scene_count or scene_count != feature_count:
+            raise RuntimeError(
+                f"Embedded PLY label count mismatch: labels={labels_np.shape[0]}, "
+                f"scene={scene_count}, feature={feature_count}."
+            )
+
+        confidence_np = np.where(labels_np >= 0, 1.0, 0.0).astype(np.float32, copy=False)
+        self.cluster_request_generation += 1
+        self.cluster_pending_result = None
+        self.cluster_job_error = None
+        self.cluster_thread = None
+        self.cluster_cache = None
+        self.cluster_cache_scale = None
+        self.cluster_point_colors = None
+        self.cluster_mesh_prior = None
+        self.seg_score = None
+        self.component_cache = {}
+        self._clear_cluster_selection()
+
+        self.cluster_cache, self.cluster_point_colors = self._build_cluster_cache_from_arrays(
+            labels_np,
+            confidence_np,
+            scale=scale,
+            method="EmbeddedPlyLabel",
+        )
+        self.cluster_cache_scale = float(scale)
+        self.external_assignment_metadata = None
+        self.external_assignment_npz_path = None
+        self.external_assignment_json_path = None
+        self.embedded_label_field = label_field
+        self.embedded_label_source_path = ply_path
+        self._set_cluster_status(
+            f"ready: {self.cluster_cache['num_clusters']} EmbeddedPlyLabel clusters @ scale={float(scale):.3f} ({label_field})",
+            state="ready",
+        )
+        print(f"Loaded embedded PLY labels from {ply_path} using field '{label_field}'")
+
+    def _densify_cluster_labels(self, labels_np):
+        labels_np = np.asarray(labels_np, dtype=np.int64).reshape(-1)
+        dense_labels = np.full(labels_np.shape, -1, dtype=np.int64)
+        valid_labels = labels_np[labels_np >= 0]
+        if valid_labels.size == 0:
+            return dense_labels, np.zeros((0,), dtype=np.int32), 0
+        unique_labels = sorted(np.unique(valid_labels).tolist())
+        for dense_idx, original_label in enumerate(unique_labels):
+            dense_labels[labels_np == int(original_label)] = dense_idx
+        counts = np.bincount(dense_labels[dense_labels >= 0], minlength=len(unique_labels)).astype(np.int32, copy=False)
+        return dense_labels, counts, int(len(unique_labels))
+
+    def _build_cluster_cache_from_arrays(self, labels_np, confidence_np, scale=None, method=None, raw_labels_np=None):
+        labels_np = np.asarray(labels_np, dtype=np.int64).reshape(-1)
+        confidence_np = np.asarray(confidence_np, dtype=np.float32).reshape(-1)
+        if labels_np.shape[0] != confidence_np.shape[0]:
+            raise ValueError(
+                f"Cluster cache labels/confidence size mismatch: {labels_np.shape[0]} vs {confidence_np.shape[0]}."
+            )
+        if raw_labels_np is None:
+            raw_labels_np = labels_np.copy()
+        else:
+            raw_labels_np = np.asarray(raw_labels_np, dtype=np.int64).reshape(-1)
+            if raw_labels_np.shape[0] != labels_np.shape[0]:
+                raise ValueError(
+                    f"Cluster cache raw_labels size mismatch: {raw_labels_np.shape[0]} vs {labels_np.shape[0]}."
+                )
+        dense_labels, counts, num_clusters = self._densify_cluster_labels(raw_labels_np)
+        point_colors = self._build_cluster_colors_from_labels(dense_labels)
+        point_codes = self._build_cluster_codes_from_labels(dense_labels)
+        self._ensure_label_code_capacity(num_clusters)
+        if num_clusters > 0:
+            cluster_codes = self.label_to_code[:num_clusters].astype(np.float32, copy=True)
+        else:
+            cluster_codes = np.zeros((0, self.opt.FEATURE_DIM), dtype=np.float32)
+        scale_value = self.last_scale_value if scale is None else scale
+        scale_value = 0.0 if scale_value is None else float(scale_value)
+        cache = {
+            "scale": scale_value,
+            "method": method or self.cluster_method,
+            "labels": torch.from_numpy(dense_labels).cuda().long(),
+            "raw_labels": torch.from_numpy(raw_labels_np).cuda().long(),
+            "confidence": torch.from_numpy(confidence_np).cuda().float(),
+            "counts": counts,
+            "num_clusters": num_clusters,
+            "point_colors_torch": torch.from_numpy(point_colors).cuda().float(),
+            "point_codes_torch": torch.from_numpy(point_codes).cuda().float(),
+            "cluster_codes_torch": torch.from_numpy(cluster_codes).cuda().float(),
+            "global_residue_hidden_mask": None,
+            "global_residue_hidden_count": 0,
+        }
+        return cache, point_colors
+
+    def _capture_scene_tensor_snapshot(self):
+        scene = self.engine['scene']
+        return {
+            "xyz": scene._xyz.detach().cpu().clone(),
+            "features_dc": scene._features_dc.detach().cpu().clone(),
+            "features_rest": scene._features_rest.detach().cpu().clone(),
+            "opacity": scene._opacity.detach().cpu().clone(),
+            "scaling": scene._scaling.detach().cpu().clone(),
+            "rotation": scene._rotation.detach().cpu().clone(),
+            "mask": scene._mask.detach().cpu().clone(),
+        }
+
+    def _capture_feature_tensor_snapshot(self):
+        feature = self.engine['feature']
+        return {
+            "xyz": feature._xyz.detach().cpu().clone(),
+            "point_features": feature._point_features.detach().cpu().clone(),
+            "opacity": feature._opacity.detach().cpu().clone(),
+            "scaling": feature._scaling.detach().cpu().clone(),
+            "rotation": feature._rotation.detach().cpu().clone(),
+            "mask": feature._mask.detach().cpu().clone(),
+        }
+
+    def _capture_cluster_cache_snapshot(self):
+        if self.cluster_cache is None:
+            return None
+        return {
+            "scale": float(self.cluster_cache.get("scale", self.cluster_cache_scale if self.cluster_cache_scale is not None else 0.0)),
+            "method": self.cluster_cache.get("method", self.cluster_method),
+            "labels": self.cluster_cache["labels"].detach().cpu().clone(),
+            "raw_labels": self.cluster_cache.get("raw_labels", self.cluster_cache["labels"]).detach().cpu().clone(),
+            "confidence": self.cluster_cache["confidence"].detach().cpu().clone(),
+            "counts": np.asarray(self.cluster_cache.get("counts", np.zeros((0,), dtype=np.int32)), dtype=np.int32).copy(),
+            "num_clusters": int(self.cluster_cache.get("num_clusters", 0)),
+        }
+
+    def _capture_structural_snapshot(self):
+        return {
+            "scene": self._capture_scene_tensor_snapshot(),
+            "feature": self._capture_feature_tensor_snapshot(),
+            "cluster_cache": self._capture_cluster_cache_snapshot(),
+            "cluster_cache_state": self.cluster_cache_state,
+            "cluster_cache_scale": self.cluster_cache_scale,
+            "cluster_method": self.cluster_method,
+            "cluster_source": self.cluster_source,
+            "last_scale_value": self.last_scale_value,
+        }
+
+    def _restore_structural_snapshot(self, snapshot):
+        scene_snapshot = snapshot["scene"]
+        feature_snapshot = snapshot["feature"]
+        self.staged_import = None
+
+        self.engine['scene'].set_inference_tensors(
+            xyz=scene_snapshot["xyz"].cuda(),
+            features_dc=scene_snapshot["features_dc"].cuda(),
+            features_rest=scene_snapshot["features_rest"].cuda(),
+            opacity=scene_snapshot["opacity"].cuda(),
+            scaling=scene_snapshot["scaling"].cuda(),
+            rotation=scene_snapshot["rotation"].cuda(),
+            mask=scene_snapshot["mask"].cuda(),
+        )
+        self.engine['feature'].set_inference_tensors(
+            xyz=feature_snapshot["xyz"].cuda(),
+            point_features=feature_snapshot["point_features"].cuda(),
+            opacity=feature_snapshot["opacity"].cuda(),
+            scaling=feature_snapshot["scaling"].cuda(),
+            rotation=feature_snapshot["rotation"].cuda(),
+            mask=feature_snapshot["mask"].cuda(),
+        )
+        self._validate_scene_feature_alignment(context="structural restore")
+
+        self.cluster_request_generation += 1
+        self.component_cache = {}
+        self.cluster_pending_result = None
+        self.cluster_job_error = None
+        self.cluster_thread = None
+        self.cluster_pick_feature_render = None
+        self.selection_debug_render = None
+        self.rendered_cluster = None
+        self.last_scene_outputs = None
+        self.last_feature_outputs = None
+        self.seg_score = None
+        self.cluster_method = snapshot.get("cluster_method", self.cluster_method)
+        self.cluster_source = snapshot.get("cluster_source", self.cluster_source)
+        if dpg.does_item_exist("_ClusterMethod"):
+            dpg.set_value("_ClusterMethod", self.cluster_method)
+        if dpg.does_item_exist("_ClusterSource"):
+            dpg.set_value("_ClusterSource", self._cluster_source_gui_value())
+
+        cluster_snapshot = snapshot.get("cluster_cache")
+        if cluster_snapshot is None:
+            self.cluster_cache = None
+            self.cluster_point_colors = None
+            self.cluster_cache_scale = snapshot.get("cluster_cache_scale")
+        else:
+            self.cluster_cache, self.cluster_point_colors = self._build_cluster_cache_from_arrays(
+                cluster_snapshot["labels"].numpy(),
+                cluster_snapshot["confidence"].numpy(),
+                scale=cluster_snapshot.get("scale"),
+                method=cluster_snapshot.get("method", self.cluster_method),
+                raw_labels_np=cluster_snapshot.get("raw_labels", cluster_snapshot["labels"]).numpy(),
+            )
+            self.cluster_cache_scale = self.cluster_cache["scale"]
+
+        restored_state = snapshot.get("cluster_cache_state", "stale")
+        if self.cluster_cache is None and restored_state == "ready":
+            restored_state = "stale"
+        self.cluster_cache_state = restored_state
+        self.last_scale_value = snapshot.get("last_scale_value", self.last_scale_value)
+        if int(self.engine['feature'].get_point_features.shape[0]) > 0:
+            self.do_pca()
+        self._mark_part_list_dirty()
+        self._update_cluster_status_widget()
+
+    def _rebuild_cluster_cache_after_structure(self, raw_labels_np, confidence_np):
+        self.cluster_request_generation += 1
+        self.component_cache = {}
+        self.cluster_pending_result = None
+        self.cluster_job_error = None
+        self.cluster_thread = None
+        self.cluster_pick_feature_render = None
+        self.selection_debug_render = None
+        self.rendered_cluster = None
+        self.last_scene_outputs = None
+        self.last_feature_outputs = None
+        self.seg_score = None
+        method = self.cluster_method
+        scale = self.last_scale_value if self.last_scale_value is not None else self.cluster_cache_scale
+        if self.cluster_cache is not None:
+            method = self.cluster_cache.get("method", method)
+            scale = self.cluster_cache.get("scale", scale)
+        self.cluster_cache, self.cluster_point_colors = self._build_cluster_cache_from_arrays(
+            raw_labels_np,
+            confidence_np,
+            scale=scale,
+            method=method,
+            raw_labels_np=raw_labels_np,
+        )
+        self.cluster_cache_scale = self.cluster_cache["scale"]
+        self.cluster_cache_state = "ready"
+        self.last_scale_value = self.cluster_cache["scale"]
+        if int(self.engine['feature'].get_point_features.shape[0]) > 0:
+            self.do_pca()
+        self._mark_part_list_dirty()
+
     def _filter_part_indices(self, part, score_thres):
         indices = part.get("source_indices")
         if indices is None:
             indices = part.get("global_indices")
+        indices = self._clip_indices_to_current_geometry(indices)
         if indices is None or indices.numel() == 0:
             return None
         if self.cluster_cache is None or score_thres <= 0.0:
@@ -690,6 +1846,141 @@ class GaussianSplattingGUI:
     def _part_fingerprint(self, indices):
         arr = indices.detach().cpu().numpy().astype(np.int64, copy=False)
         return f"{arr.shape[0]}:{hashlib.blake2b(arr.tobytes(), digest_size=16).hexdigest()}"
+
+    def _current_geometry_count(self):
+        scene_count = int(self.engine['scene'].get_xyz.shape[0])
+        feature_count = int(self.engine['feature'].get_xyz.shape[0])
+        return int(min(scene_count, feature_count))
+
+    def _mask_matches_current_geometry(self, mask):
+        if mask is None:
+            return True
+        if not torch.is_tensor(mask):
+            return False
+        return int(mask.shape[0]) == self._current_geometry_count()
+
+    def _clip_indices_to_current_geometry(self, indices):
+        if indices is None:
+            return None
+        indices = indices.long().reshape(-1)
+        if indices.numel() == 0:
+            return indices
+        max_count = self._current_geometry_count()
+        valid = (indices >= 0) & (indices < max_count)
+        if bool(valid.all().item()):
+            return indices
+        clipped = indices[valid]
+        return clipped if clipped.numel() > 0 else indices[:0]
+
+    def _active_group_geometry_is_current(self):
+        active_group = self.active_group
+        if active_group is None:
+            return True
+        max_count = self._current_geometry_count()
+        mask_keys = (
+            "selection_mask",
+            "visible_selection_mask",
+            "preview_mask",
+            "hidden_mask",
+            "residue_hidden_mask",
+        )
+        for key in mask_keys:
+            mask = active_group.get(key)
+            if torch.is_tensor(mask) and int(mask.shape[0]) != max_count:
+                return False
+
+        index_keys = ("global_indices", "visible_global_indices", "preview_indices")
+        for key in index_keys:
+            indices = active_group.get(key)
+            if torch.is_tensor(indices) and indices.numel() > 0:
+                if int(indices.min().item()) < 0 or int(indices.max().item()) >= max_count:
+                    return False
+
+        for part in active_group.get("parts", []):
+            for key in ("source_indices", "global_indices", "all_global_indices", "visible_global_indices", "residue_hidden_indices"):
+                indices = part.get(key)
+                if torch.is_tensor(indices) and indices.numel() > 0:
+                    if int(indices.min().item()) < 0 or int(indices.max().item()) >= max_count:
+                        return False
+        return True
+
+    def _drop_stale_active_group(self, reason="geometry changed"):
+        if self.active_group is None:
+            return
+        print(f"Dropping stale active group: {reason}")
+        self.active_group = None
+        self._mark_part_list_dirty()
+        self._clear_active_ui_state()
+        self.selection_debug_render = None
+
+    def _get_active_group_if_ready(self):
+        active_group = self.active_group
+        if active_group is None or not active_group.get("cuboid_ready", False):
+            return None
+        if not self._active_group_geometry_is_current():
+            self._drop_stale_active_group(reason="selection tensors no longer match current geometry")
+            return None
+        return active_group
+
+    def _cluster_cache_geometry_is_current(self):
+        cache = self.cluster_cache
+        if cache is None:
+            return True
+        max_count = self._current_geometry_count()
+        tensor_keys = ("labels", "raw_labels", "confidence", "point_colors_torch", "point_codes_torch")
+        for key in tensor_keys:
+            value = cache.get(key)
+            if torch.is_tensor(value) and int(value.shape[0]) != max_count:
+                return False
+        hidden_mask = cache.get("global_residue_hidden_mask")
+        if torch.is_tensor(hidden_mask) and int(hidden_mask.shape[0]) != max_count:
+            return False
+        return True
+
+    def _runtime_alignment_error_message(self, context="runtime"):
+        scene_count = int(self.engine['scene'].get_xyz.shape[0])
+        feature_count = int(self.engine['feature'].get_xyz.shape[0])
+        return (
+            f"{context}: scene/feature Gaussian count mismatch "
+            f"(scene={scene_count}, feature={feature_count})"
+        )
+
+    def _drop_stale_cluster_cache(self, reason="cluster cache no longer matches current geometry"):
+        if self.cluster_cache is None and self.cluster_cache_state != "ready":
+            return
+        print(f"Dropping stale cluster cache: {reason}")
+        self.cluster_request_generation += 1
+        self.component_cache = {}
+        self.cluster_cache = None
+        self.cluster_cache_scale = None
+        self.cluster_pending_result = None
+        self.cluster_job_error = None
+        self.cluster_thread = None
+        self.cluster_point_colors = None
+        self.cluster_mesh_prior = None
+        self.seg_score = None
+        self.cluster_pick_feature_render = None
+        self.cluster_cache_state = "stale"
+        self.cluster_status_message = f"stale: {reason}"
+
+    def _ensure_runtime_geometry_consistency(self):
+        if not self._cluster_cache_geometry_is_current():
+            self._drop_stale_cluster_cache(reason="cluster cache no longer matches current geometry")
+        if self.active_group is not None and not self._active_group_geometry_is_current():
+            self._drop_stale_active_group(reason="selection tensors no longer match current geometry")
+        scene_count = int(self.engine['scene'].get_xyz.shape[0])
+        feature_count = int(self.engine['feature'].get_xyz.shape[0])
+        if scene_count != feature_count:
+            self._drop_stale_active_group(reason="scene/feature geometry mismatch")
+            self._drop_stale_cluster_cache(reason="scene/feature geometry mismatch")
+            self.selection_debug_render = None
+            self.cluster_pick_feature_render = None
+            self.last_scene_outputs = None
+            self.last_feature_outputs = None
+            self.cluster_status_message = self._runtime_alignment_error_message(context="runtime")
+            self.cluster_cache_state = "stale"
+            return False
+        return True
 
     def _part_exists_in_pending(self, fingerprint):
         return any(part.get("fingerprint") == fingerprint for part in self.pending_parts)
@@ -766,7 +2057,8 @@ class GaussianSplattingGUI:
         self.part_list_dirty = True
 
     def _pending_active_signature(self):
-        active_parts = [] if self.active_group is None else self.active_group.get("parts", [])
+        active_group = self._get_active_group_if_ready()
+        active_parts = [] if active_group is None else active_group.get("parts", [])
         pending_parts = self.pending_parts
         pending_sig = tuple(part.get("fingerprint") for part in pending_parts)
         active_sig = tuple(part.get("fingerprint") for part in active_parts)
@@ -813,7 +2105,8 @@ class GaussianSplattingGUI:
             return
         if not dpg.does_item_exist("_cluster_pending_rows") or not dpg.does_item_exist("_cluster_active_rows"):
             return
-        active_parts = [] if self.active_group is None else self.active_group.get("parts", [])
+        active_group = self._get_active_group_if_ready()
+        active_parts = [] if active_group is None else active_group.get("parts", [])
         pending_parts = self.pending_parts
         self._rebuild_part_row_list("_cluster_pending_rows", pending_parts, active=False)
         self._rebuild_part_row_list("_cluster_active_rows", active_parts, active=True)
@@ -826,6 +2119,44 @@ class GaussianSplattingGUI:
         theme_tag = "_ShowActiveButtonOnTheme" if self.show_active else "_ShowActiveButtonOffTheme"
         if dpg.does_item_exist(theme_tag):
             dpg.bind_item_theme("_ShowActiveButton", theme_tag)
+
+    def _configure_item_enabled(self, tag, enabled):
+        if dpg.does_item_exist(tag):
+            dpg.configure_item(tag, enabled=enabled)
+
+    def _refresh_staged_import_control_state(self, has_active, has_pending, has_structural_edit_target):
+        staged_locked = self._staged_import_active()
+        selection_enabled = not staged_locked
+        cluster_ready = self.cluster_cache is not None and self.cluster_cache_state == "ready"
+        self._configure_item_enabled("_Scale", not staged_locked)
+        self._configure_item_enabled("_ScoreThres", not staged_locked)
+        self._configure_item_enabled("_InstanceSelect", (not staged_locked) and len(self.instance_names) > 1)
+        self._configure_item_enabled("_ImportInstanceButton", (not staged_locked) and cluster_ready)
+        self._configure_item_enabled("_ReclusterButton", not staged_locked)
+        self._configure_item_enabled("_ClusterSource", not staged_locked)
+        self._configure_item_enabled("_ClusterMethod", not staged_locked)
+        self._configure_item_enabled("_HideUnassignedGaussians", not staged_locked)
+        self._configure_item_enabled("_HideSmallResidue", not staged_locked)
+        self._configure_item_enabled("_ResidueMaxSize", not staged_locked)
+        self._configure_item_enabled("_ResidueScope", not staged_locked)
+        self._configure_item_enabled("_ExcludeResidueExport", not staged_locked)
+        self._configure_item_enabled("_PreviewMaxGaussians", not staged_locked)
+        self._configure_item_enabled("_CuboidPercentile", not staged_locked)
+        self._configure_item_enabled("_CreateCuboidButton", selection_enabled and (not has_active and has_pending))
+        self._configure_item_enabled("_AddActiveButton", selection_enabled and has_active and has_pending)
+        self._configure_item_enabled("_RemoveActiveButton", selection_enabled and has_active and has_pending)
+        self._configure_item_enabled("_ClearActiveButton", selection_enabled and has_active)
+        self._configure_item_enabled("_CopyActiveButton", selection_enabled and has_structural_edit_target)
+        self._configure_item_enabled("_DeleteActiveButton", selection_enabled and has_structural_edit_target)
+        self._configure_item_enabled("_UndoButton", (not staged_locked) and len(self.apply_undo_stack) > 0)
+        self._configure_item_enabled("_RedoButton", (not staged_locked) and len(self.apply_redo_stack) > 0)
+        self._configure_item_enabled("_SaveActiveButton", (not staged_locked) and has_active)
+        self._configure_item_enabled("_SaveFullButton", not staged_locked)
+        self._configure_item_enabled("_ShowActiveButton", (not staged_locked) and has_active)
+        self._configure_item_enabled("_ApplyActiveButton", has_active)
+        self._configure_item_enabled("_CancelActiveButton", has_active)
+        self._configure_item_enabled("_CuboidManipulation", has_active)
+        self._configure_item_enabled("_TransformMode", has_active)
 
     def _format_part_list_text(self, title, parts, active=False):
         prefix = "A" if active else "P"
@@ -871,8 +2202,7 @@ class GaussianSplattingGUI:
         self._update_cluster_status_widget()
 
     def _update_cluster_status_widget(self):
-        active_parts = [] if self.active_group is None else self.active_group.get("parts", [])
-        pending_parts = self.pending_parts
+        active_group = self._get_active_group_if_ready()
         selected_points = 0
         if self.cluster_cache is not None:
             score_thres = 0.0 if self.last_score_threshold is None else self.last_score_threshold
@@ -880,20 +2210,24 @@ class GaussianSplattingGUI:
             if selection_mask is not None:
                 selected_points = int(selection_mask.sum().item())
 
+        active_parts = [] if active_group is None else active_group.get("parts", [])
+        pending_parts = self.pending_parts
+
         if self.cluster_cache is not None and self.cluster_cache_state == "ready":
             cluster_summary = f"{self.cluster_cache['num_clusters']} {self.cluster_cache.get('method', 'HDBSCAN')} @ {self.cluster_cache['scale']:.3f}"
         elif self.cluster_cache_state == "clustering":
-            cluster_summary = f"{self.cluster_method} @ {self.last_scale_value:.3f}" if self.last_scale_value is not None else self.cluster_method
+            cluster_label = self._cluster_source_status_label()
+            cluster_summary = f"{cluster_label} @ {self.last_scale_value:.3f}" if self.last_scale_value is not None else cluster_label
         else:
             cluster_summary = "none"
 
         last_pick_value = "none" if self.last_picked_cluster_id is None else str(self.last_picked_cluster_id)
         global_hidden = 0 if self.cluster_cache is None else int(self.cluster_cache.get("global_residue_hidden_count", 0) or 0)
-        active_hidden = 0 if self.active_group is None else int(self.active_group.get("residue_hidden_count", 0) or 0)
+        active_hidden = 0 if active_group is None else int(active_group.get("residue_hidden_count", 0) or 0)
 
         line1 = f"Cache: {self.cluster_cache_state}\nClusters: {cluster_summary}"
-        line2 = f"Last: {last_pick_value}"
-        line3 = f"Pending: {len(pending_parts)} | Active: {len(active_parts)} | G: {selected_points}\nPick: {self.last_pick_result}"
+        line2 = f"Instance: {self._current_instance_display_name()} | Source: {self._cluster_source_status_label()}\nStatus: {self.cluster_status_message}"
+        line3 = f"Pending: {len(pending_parts)} | Active: {len(active_parts)} | G: {selected_points}\nLast: {last_pick_value} | Pick: {self.last_pick_result}"
         residue_line = f"Residue: active {active_hidden} | global {global_hidden}"
 
         if dpg.does_item_exist("_cluster_summary_line1"):
@@ -914,12 +2248,25 @@ class GaussianSplattingGUI:
             dpg.configure_item("_AddActiveButton", show=has_active, enabled=(has_active and has_pending))
         if dpg.does_item_exist("_RemoveActiveButton"):
             dpg.configure_item("_RemoveActiveButton", show=has_active, enabled=(has_active and has_pending))
+        active_visible_indices = self._current_structural_active_indices()
+        has_structural_edit_target = (
+            self.cluster_cache is not None
+            and self.cluster_cache_state == "ready"
+            and has_active
+            and active_visible_indices is not None
+            and int(active_visible_indices.numel()) > 0
+        )
+        if dpg.does_item_exist("_CopyActiveButton"):
+            dpg.configure_item("_CopyActiveButton", enabled=has_structural_edit_target)
+        if dpg.does_item_exist("_DeleteActiveButton"):
+            dpg.configure_item("_DeleteActiveButton", enabled=has_structural_edit_target)
         if dpg.does_item_exist("_ShowActiveButton"):
             dpg.configure_item("_ShowActiveButton", enabled=has_active)
         if dpg.does_item_exist("_PendingTab"):
             dpg.configure_item("_PendingTab", label=f"Pending ({len(pending_parts)})")
         if dpg.does_item_exist("_ActiveTab"):
             dpg.configure_item("_ActiveTab", label=f"Active ({len(active_parts)})")
+        self._refresh_staged_import_control_state(has_active, has_pending, has_structural_edit_target)
         self._update_show_active_button_theme()
 
     def _set_pick_feedback(self, cluster_id, result):
@@ -1021,12 +2368,26 @@ class GaussianSplattingGUI:
             cached_mask = self._compute_global_residue_hidden_mask()
             self.cluster_cache["global_residue_hidden_mask"] = cached_mask
             self.cluster_cache["global_residue_hidden_count"] = 0 if cached_mask is None else int(cached_mask.sum().item())
+        if not self._mask_matches_current_geometry(cached_mask):
+            self._clear_global_residue_cache()
+            return None
         return cached_mask
 
     def _current_active_residue_hidden_mask(self):
-        if not self._active_group_has_cuboid() or not self._active_residue_enabled():
+        active_group = self._get_active_group_if_ready()
+        if active_group is None or not self._active_residue_enabled():
             return None
-        return self.active_group.get("residue_hidden_mask")
+        mask = active_group.get("residue_hidden_mask")
+        return mask if self._mask_matches_current_geometry(mask) else None
+
+    def _current_unassigned_hidden_mask(self):
+        if not self.hide_unassigned_gaussians or self.cluster_cache is None or self.cluster_cache_state != "ready":
+            return None
+        labels = self.cluster_cache["labels"]
+        hidden_mask = labels < 0
+        if int(hidden_mask.sum().item()) == 0:
+            return None
+        return hidden_mask if self._mask_matches_current_geometry(hidden_mask) else None
 
     def _combined_hidden_mask(self):
         combined_mask = None
@@ -1038,6 +2399,10 @@ class GaussianSplattingGUI:
         global_hidden_mask = self._current_global_residue_hidden_mask()
         if global_hidden_mask is not None:
             combined_mask = global_hidden_mask.clone() if combined_mask is None else (combined_mask | global_hidden_mask)
+
+        unassigned_hidden_mask = self._current_unassigned_hidden_mask()
+        if unassigned_hidden_mask is not None:
+            combined_mask = unassigned_hidden_mask.clone() if combined_mask is None else (combined_mask | unassigned_hidden_mask)
 
         active_hidden_mask = self._current_active_residue_hidden_mask()
         if active_hidden_mask is not None:
@@ -1055,6 +2420,7 @@ class GaussianSplattingGUI:
         else:
             score_thres = 0.0 if score_thres is None else float(score_thres)
             indices = self._filter_part_indices(part, score_thres)
+        indices = self._clip_indices_to_current_geometry(indices)
         if indices is None or indices.numel() == 0:
             return indices
 
@@ -1073,6 +2439,9 @@ class GaussianSplattingGUI:
         return indices
 
     def _on_residue_settings_changed(self, reason):
+        if self._staged_import_active():
+            self._set_cluster_status("residue settings are locked while a staged import is active")
+            return
         self._clear_global_residue_cache()
         if self._active_group_has_cuboid():
             self._rebuild_active_group_for_score(0.0 if self.last_score_threshold is None else float(self.last_score_threshold))
@@ -1248,15 +2617,17 @@ class GaussianSplattingGUI:
         return torch.nn.functional.normalize(self._quat_multiply(group_quat, rotations), dim=-1)
 
     def _active_group_has_cuboid(self):
-        return self.active_group is not None and self.active_group.get("cuboid_ready", False)
+        return self._get_active_group_if_ready() is not None
 
     def _get_active_selection_mask(self):
-        if self.active_group is None:
+        active_group = self._get_active_group_if_ready()
+        if active_group is None:
             return None
-        if self.active_group.get("selection_mask") is not None:
-            return self.active_group["selection_mask"]
+        if active_group.get("selection_mask") is not None:
+            selection_mask = active_group["selection_mask"]
+            return selection_mask if self._mask_matches_current_geometry(selection_mask) else None
         score_thres = 0.0 if self.last_score_threshold is None else self.last_score_threshold
-        return self._build_mask_for_cluster_ids(self.active_group["cluster_ids"], score_thres)
+        return self._build_mask_for_cluster_ids(active_group["cluster_ids"], score_thres)
 
     def _get_cuboid_percentile(self):
         percentile = self.cuboid_percentile
@@ -1705,39 +3076,177 @@ class GaussianSplattingGUI:
             self.engine['feature']._scaling[indices] = snapshot["feature_scaling_raw"].to(self.engine['feature']._scaling.device)
             self.engine['feature']._opacity[indices] = snapshot["feature_opacity_raw"].to(self.engine['feature']._opacity.device)
 
-    def _push_apply_history(self, before_snapshot, after_snapshot):
-        self.apply_undo_stack.append({"before": before_snapshot, "after": after_snapshot})
+    def _push_apply_history(self, before_snapshot, after_snapshot, kind="transform"):
+        self.apply_undo_stack.append({"kind": kind, "before": before_snapshot, "after": after_snapshot})
         if len(self.apply_undo_stack) > self.max_apply_history:
             self.apply_undo_stack = self.apply_undo_stack[-self.max_apply_history:]
         self.apply_redo_stack = []
 
     def _prepare_history_navigation(self):
+        if self._staged_import_active():
+            self._cancel_staged_import()
         if self._active_group_has_cuboid():
             self._cancel_active_group()
-            self._clear_active_ui_state()
-            self._clear_cluster_selection()
+        self._clear_active_ui_state()
+        self._clear_cluster_selection()
 
     def _undo_last_apply(self):
+        if self._staged_import_active():
+            self._set_cluster_status("undo is disabled while a staged import is active")
+            return
         self._prepare_history_navigation()
         if len(self.apply_undo_stack) == 0:
             self._set_cluster_status("undo: no earlier applied version")
             return
         entry = self.apply_undo_stack.pop()
-        self._restore_state_snapshot(entry["before"])
+        entry_kind = entry.get("kind", "transform")
+        if entry_kind == "structure":
+            self._restore_structural_snapshot(entry["before"])
+        else:
+            self._restore_state_snapshot(entry["before"])
         self.apply_redo_stack.append(entry)
-        self._set_cluster_status(f"undo applied ({len(self.apply_undo_stack)} left)")
+        status_prefix = "undo structure edit" if entry_kind == "structure" else "undo applied"
+        self._set_cluster_status(f"{status_prefix} ({len(self.apply_undo_stack)} left)")
 
     def _redo_last_apply(self):
+        if self._staged_import_active():
+            self._set_cluster_status("redo is disabled while a staged import is active")
+            return
         self._prepare_history_navigation()
         if len(self.apply_redo_stack) == 0:
             self._set_cluster_status("redo: no later applied version")
             return
         entry = self.apply_redo_stack.pop()
-        self._restore_state_snapshot(entry["after"])
+        entry_kind = entry.get("kind", "transform")
+        if entry_kind == "structure":
+            self._restore_structural_snapshot(entry["after"])
+        else:
+            self._restore_state_snapshot(entry["after"])
         self.apply_undo_stack.append(entry)
         if len(self.apply_undo_stack) > self.max_apply_history:
             self.apply_undo_stack = self.apply_undo_stack[-self.max_apply_history:]
-        self._set_cluster_status(f"redo applied ({len(self.apply_redo_stack)} forward)")
+        status_prefix = "redo structure edit" if entry_kind == "structure" else "redo applied"
+        self._set_cluster_status(f"{status_prefix} ({len(self.apply_redo_stack)} forward)")
+
+    def _copy_active_gaussians(self):
+        if self._staged_import_active():
+            self._set_cluster_status("copy active is disabled while a staged import is active")
+            return
+        if self.cluster_cache is None or self.cluster_cache_state != "ready":
+            self._set_cluster_status("copy active: cluster cache is not ready")
+            return
+        if not self._active_group_has_cuboid():
+            self._set_cluster_status("copy active: no active cuboid")
+            return
+        self._commit_active_group_if_dirty()
+        source_indices = self._current_structural_active_indices()
+        if source_indices is None or source_indices.numel() == 0:
+            self._set_cluster_status("copy active: no visible active gaussians")
+            return
+
+        before_snapshot = self._capture_structural_snapshot()
+
+        scene = self.engine['scene']
+        feature = self.engine['feature']
+        old_count = int(scene._xyz.shape[0])
+        copy_count = int(source_indices.shape[0])
+        raw_labels_np = self._cluster_cache_raw_labels_np()
+        if raw_labels_np is None:
+            raw_labels_np = self.cluster_cache["labels"].detach().cpu().numpy().astype(np.int64, copy=False)
+        valid_raw = raw_labels_np[raw_labels_np >= 0]
+        new_raw_label = (int(valid_raw.max()) + 1) if valid_raw.size > 0 else 0
+
+        scene.append_inference_tensors(
+            xyz=scene._xyz[source_indices].detach().clone(),
+            features_dc=scene._features_dc[source_indices].detach().clone(),
+            features_rest=scene._features_rest[source_indices].detach().clone(),
+            opacity=scene._opacity[source_indices].detach().clone(),
+            scaling=scene._scaling[source_indices].detach().clone(),
+            rotation=scene._rotation[source_indices].detach().clone(),
+        )
+        feature.append_inference_tensors(
+            xyz=feature._xyz[source_indices].detach().clone(),
+            point_features=feature._point_features[source_indices].detach().clone(),
+            opacity=feature._opacity[source_indices].detach().clone(),
+            scaling=feature._scaling[source_indices].detach().clone(),
+            rotation=feature._rotation[source_indices].detach().clone(),
+        )
+        self._validate_scene_feature_alignment(context="copy active gaussians")
+
+        source_indices_cpu = source_indices.detach().cpu().numpy().astype(np.int64, copy=False)
+        confidence_np = self.cluster_cache["confidence"].detach().cpu().numpy().astype(np.float32, copy=False)
+        copied_labels = np.full((copy_count,), new_raw_label, dtype=np.int64)
+        copied_confidence = confidence_np[source_indices_cpu].copy()
+        self._rebuild_cluster_cache_after_structure(
+            np.concatenate((raw_labels_np, copied_labels), axis=0),
+            np.concatenate((confidence_np, copied_confidence), axis=0),
+        )
+
+        new_indices = torch.arange(old_count, old_count + copy_count, device=scene._xyz.device, dtype=torch.long)
+        dense_labels = self.cluster_cache["labels"][new_indices]
+        if dense_labels.numel() == 0:
+            self._prepare_history_navigation()
+            self._restore_structural_snapshot(before_snapshot)
+            self._set_cluster_status("copy active: failed to rebuild copied selection")
+            return
+        copied_part = self._build_part_from_component_indices(
+            int(dense_labels[0].item()),
+            new_indices,
+            seed_index=int(new_indices[0].item()) if copy_count > 0 else None,
+            source="copy",
+        )
+        self._clear_cluster_selection()
+        if copied_part is None or not self._set_active_group_from_source_parts(
+            [copied_part],
+            success_status=f"copied {copy_count} active gaussians to new active cluster",
+            empty_status="copied active gaussians but failed to rebuild active selection",
+        ):
+            self._prepare_history_navigation()
+            self._restore_structural_snapshot(before_snapshot)
+            self._set_cluster_status("copy active: failed to rebuild copied selection")
+            return
+
+        after_snapshot = self._capture_structural_snapshot()
+        self._push_apply_history(before_snapshot, after_snapshot, kind="structure")
+
+    def _delete_active_gaussians(self):
+        if self._staged_import_active():
+            self._set_cluster_status("delete active is disabled while a staged import is active")
+            return
+        if self.cluster_cache is None or self.cluster_cache_state != "ready":
+            self._set_cluster_status("delete active: cluster cache is not ready")
+            return
+        if not self._active_group_has_cuboid():
+            self._set_cluster_status("delete active: no active cuboid")
+            return
+        self._commit_active_group_if_dirty()
+        delete_indices = self._current_structural_active_indices()
+        if delete_indices is None or delete_indices.numel() == 0:
+            self._set_cluster_status("delete active: no visible active gaussians")
+            return
+
+        before_snapshot = self._capture_structural_snapshot()
+
+        scene = self.engine['scene']
+        feature = self.engine['feature']
+        delete_count = int(delete_indices.shape[0])
+        prune_mask = torch.zeros((scene._xyz.shape[0],), device=scene._xyz.device, dtype=torch.bool)
+        prune_mask[delete_indices] = True
+        scene.prune_inference_tensors(prune_mask)
+        feature.prune_inference_tensors(prune_mask)
+        self._validate_scene_feature_alignment(context="delete active gaussians")
+
+        keep_mask_np = (~prune_mask).detach().cpu().numpy().astype(bool, copy=False)
+        labels_np = self._cluster_cache_raw_labels_np()
+        if labels_np is None:
+            labels_np = self.cluster_cache["labels"].detach().cpu().numpy().astype(np.int64, copy=False)
+        confidence_np = self.cluster_cache["confidence"].detach().cpu().numpy().astype(np.float32, copy=False)
+        self._rebuild_cluster_cache_after_structure(labels_np[keep_mask_np], confidence_np[keep_mask_np])
+        self._clear_cluster_selection()
+
+        after_snapshot = self._capture_structural_snapshot()
+        self._push_apply_history(before_snapshot, after_snapshot, kind="structure")
+        self._set_cluster_status(f"deleted {delete_count} active gaussians")
 
     def _clear_active_ui_state(self):
         self._end_cuboid_drag()
@@ -1750,8 +3259,11 @@ class GaussianSplattingGUI:
         if self._active_group_has_cuboid() and self.active_group.get("dirty_transform", False):
             self._cancel_active_group()
 
-    def _set_active_group_from_source_parts(self, source_parts, success_status, empty_status):
-        score_thres = 0.0 if self.last_score_threshold is None else float(self.last_score_threshold)
+    def _set_active_group_from_source_parts(self, source_parts, success_status, empty_status, score_thres_override=None):
+        if score_thres_override is None:
+            score_thres = 0.0 if self.last_score_threshold is None else float(self.last_score_threshold)
+        else:
+            score_thres = float(score_thres_override)
         rebuilt = self._build_active_group([self._clone_part(part) for part in source_parts], score_thres)
         if rebuilt is None:
             self.active_group = None
@@ -1766,6 +3278,9 @@ class GaussianSplattingGUI:
         return True
 
     def _remove_pending_part_by_fingerprint(self, fingerprint):
+        if self._staged_import_active():
+            self._set_cluster_status("pending edits are disabled while a staged import is active")
+            return
         pending_idx = self._find_pending_part_index(fingerprint)
         if pending_idx is None:
             self._set_cluster_status("remove pending: part not found")
@@ -1775,6 +3290,9 @@ class GaussianSplattingGUI:
         self._set_cluster_status(f"removed pending part ({len(self.pending_parts)} pending left)")
 
     def _move_pending_part_to_active(self, fingerprint):
+        if self._staged_import_active():
+            self._set_cluster_status("selection edits are disabled while a staged import is active")
+            return
         pending_idx = self._find_pending_part_index(fingerprint)
         if pending_idx is None:
             self._set_cluster_status("move to active: pending part not found")
@@ -1809,6 +3327,9 @@ class GaussianSplattingGUI:
             self._update_cluster_status_widget()
 
     def _remove_active_part_by_fingerprint(self, fingerprint, move_to_pending=False):
+        if self._staged_import_active():
+            self._set_cluster_status("selection edits are disabled while a staged import is active")
+            return
         if not self._active_group_has_cuboid():
             self._set_cluster_status("active row action: no active cuboid")
             return
@@ -1854,6 +3375,9 @@ class GaussianSplattingGUI:
         )
 
     def _add_pending_to_active_group(self):
+        if self._staged_import_active():
+            self._set_cluster_status("selection edits are disabled while a staged import is active")
+            return
         if len(self.pending_parts) == 0:
             self._set_cluster_status("add active: no pending parts")
             return
@@ -1876,6 +3400,9 @@ class GaussianSplattingGUI:
         )
 
     def _remove_pending_from_active_group(self):
+        if self._staged_import_active():
+            self._set_cluster_status("selection edits are disabled while a staged import is active")
+            return
         if len(self.pending_parts) == 0:
             self._set_cluster_status("remove active: no pending parts")
             return
@@ -1897,6 +3424,9 @@ class GaussianSplattingGUI:
         )
 
     def _apply_and_clear_active_group(self):
+        if self._staged_import_active():
+            self._apply_staged_import()
+            return
         if not self._active_group_has_cuboid():
             return
         active_group = self.active_group
@@ -1915,6 +3445,9 @@ class GaussianSplattingGUI:
             self._set_cluster_status("active transform applied")
 
     def _clear_active_group_and_restore(self):
+        if self._staged_import_active():
+            self._set_cluster_status("clear active is disabled while a staged import is active")
+            return
         if self._active_group_has_cuboid():
             self._cancel_active_group()
         self._clear_active_ui_state()
@@ -1922,6 +3455,8 @@ class GaussianSplattingGUI:
         self._set_cluster_status("selection cleared and restored")
 
     def _rebuild_active_group_for_score(self, score_thres):
+        if self._staged_import_active():
+            return
         if not self._active_group_has_cuboid():
             return
         source_parts = [self._clone_part(part) for part in self.active_group.get("source_parts", [])]
@@ -1978,13 +3513,13 @@ class GaussianSplattingGUI:
         dpg.draw_rectangle(pmin, pmax, color=(255, 220, 64, 255), fill=(255, 220, 64, 32), thickness=2.0, parent="_overlay_drawlist")
 
     def _draw_active_cuboid_overlay(self, view_camera):
-        if not self._active_group_has_cuboid() or not dpg.does_item_exist("_overlay_drawlist") or not dpg.does_item_exist("_render_image"):
+        active_group = self._get_active_group_if_ready()
+        if active_group is None or not dpg.does_item_exist("_overlay_drawlist") or not dpg.does_item_exist("_render_image"):
             return
         image_rect_min = dpg.get_item_rect_min("_render_image")
         image_rect_size = dpg.get_item_rect_size("_render_image")
         if image_rect_min is None or image_rect_size is None:
             return
-        active_group = self.active_group
         corners = self._cuboid_corners_world(active_group)
         projected_xy, depth, valid = self._project_points(view_camera, corners)
         if int(valid.sum().item()) != 8:
@@ -2030,6 +3565,9 @@ class GaussianSplattingGUI:
         self._draw_marquee_overlay()
 
     def _invalidate_cluster_cache(self, reason="scale changed"):
+        if self._staged_import_active():
+            self._set_cluster_status("recluster settings are locked while a staged import is active")
+            return
         self._cancel_preview_for_selection_change()
         self.cluster_request_generation += 1
         self.component_cache = {}
@@ -2039,6 +3577,12 @@ class GaussianSplattingGUI:
         self.cluster_job_error = None
         self.cluster_thread = None
         self.cluster_point_colors = None
+        self.external_assignment_metadata = None
+        self.external_assignment_npz_path = None
+        self.external_assignment_json_path = None
+        self.embedded_label_field = None
+        self.embedded_label_source_path = None
+        self.cluster_mesh_prior = None
         self.seg_score = None
         self._clear_cluster_selection()
         self._set_cluster_status(f"stale: {reason}", state="stale")
@@ -2179,8 +3723,36 @@ class GaussianSplattingGUI:
         )
 
     def _start_recluster(self, scale):
+        if self._staged_import_active():
+            self._set_cluster_status("recluster is disabled while a staged import is active")
+            return
         if self.cluster_cache_state == "clustering":
             return
+        if self.cluster_source == CLUSTER_SOURCE_EXTERNAL:
+            print("Loading external 3D cluster assignment...")
+            try:
+                self._load_external_cluster_assignment(scale)
+            except Exception as exc:
+                self.cluster_thread = None
+                self.cluster_cache = None
+                self.cluster_cache_scale = None
+                self.cluster_point_colors = None
+                self._set_cluster_status(f"error: {exc}", state="stale")
+                print(f"External cluster import failed: {exc}")
+            return
+        if self.cluster_source == CLUSTER_SOURCE_PLY_LABEL:
+            print("Loading embedded 3D cluster labels from PLY...")
+            try:
+                self._load_embedded_ply_cluster_assignment(scale)
+            except Exception as exc:
+                self.cluster_thread = None
+                self.cluster_cache = None
+                self.cluster_cache_scale = None
+                self.cluster_point_colors = None
+                self._set_cluster_status(f"error: {exc}", state="stale")
+                print(f"Embedded PLY label import failed: {exc}")
+            return
+
         print(f"Clustering in 3D with {self.cluster_method}...")
         self._validate_scene_feature_alignment(context="clustering")
 
@@ -2262,30 +3834,16 @@ class GaussianSplattingGUI:
         if result["generation"] != self.cluster_request_generation:
             return
 
-        labels_np = result["labels"]
-        confidence_np = result["confidence"]
-        point_colors = self._build_cluster_colors_from_labels(labels_np)
-        point_codes = self._build_cluster_codes_from_labels(labels_np)
-        self._ensure_label_code_capacity(result["num_clusters"])
-        cluster_codes = self.label_to_code[:result["num_clusters"]].astype(np.float32, copy=True)
-        self.cluster_cache = {
-            "scale": result["scale"],
-            "method": result.get("method", self.cluster_method),
-            "labels": torch.from_numpy(labels_np).cuda().long(),
-            "confidence": torch.from_numpy(confidence_np).cuda().float(),
-            "counts": result["counts"],
-            "num_clusters": result["num_clusters"],
-            "point_colors_torch": torch.from_numpy(point_colors).cuda().float(),
-            "point_codes_torch": torch.from_numpy(point_codes).cuda().float(),
-            "cluster_codes_torch": torch.from_numpy(cluster_codes).cuda().float(),
-            "global_residue_hidden_mask": None,
-            "global_residue_hidden_count": 0,
-        }
+        self.cluster_cache, self.cluster_point_colors = self._build_cluster_cache_from_arrays(
+            result["labels"],
+            result["confidence"],
+            scale=result["scale"],
+            method=result.get("method", self.cluster_method),
+        )
         self.cluster_cache_scale = result["scale"]
-        self.cluster_point_colors = point_colors
         self.cluster_thread = None
         self._set_cluster_status(
-            f"ready: {result['num_clusters']} {result.get('method', self.cluster_method)} clusters @ scale={result['scale']:.3f}",
+            f"ready: {self.cluster_cache['num_clusters']} {self.cluster_cache.get('method', self.cluster_method)} clusters @ scale={result['scale']:.3f}",
             state="ready",
         )
         print("Clustering finished.")
@@ -2302,20 +3860,24 @@ class GaussianSplattingGUI:
 
 
     def _build_selection_mask(self, score_thres):
-        if self._active_group_has_cuboid():
-            selection_mask = self.active_group.get("visible_selection_mask", self.active_group.get("selection_mask"))
+        active_group = self._get_active_group_if_ready()
+        if active_group is not None:
+            selection_mask = active_group.get("visible_selection_mask", active_group.get("selection_mask"))
+            if not self._mask_matches_current_geometry(selection_mask):
+                return None
             global_hidden_mask = self._current_global_residue_hidden_mask()
-            if selection_mask is not None and global_hidden_mask is not None:
+            if selection_mask is not None and global_hidden_mask is not None and self._mask_matches_current_geometry(global_hidden_mask):
                 selection_mask = selection_mask & ~global_hidden_mask
             return selection_mask
         return self._pending_selection_mask(score_thres)
 
     def _build_parts_for_debug_render(self, score_thres):
-        if self._active_group_has_cuboid():
+        active_group = self._get_active_group_if_ready()
+        if active_group is not None:
             if not self.show_active:
                 return []
             debug_parts = []
-            for part in self.active_group.get("parts", []):
+            for part in active_group.get("parts", []):
                 indices = self._part_visible_indices(part, active=True)
                 if indices is None or indices.numel() == 0:
                     continue
@@ -2592,15 +4154,22 @@ class GaussianSplattingGUI:
         return np.array([local_x, local_y], dtype=np.float32)
 
     def _queue_cluster_pick_request(self, mouse_xy=None):
+        if self._staged_import_active():
+            return
         if mouse_xy is None:
             mouse_xy = self._get_local_mouse_pos()
         if mouse_xy is not None:
             self.cluster_pick_request = np.asarray(mouse_xy, dtype=np.float32)
 
     def _queue_marquee_request(self, start_xy, end_xy):
+        if self._staged_import_active():
+            return
         self.marquee_request = (np.asarray(start_xy, dtype=np.float32), np.asarray(end_xy, dtype=np.float32))
 
     def _consume_cluster_pick_request(self, view_camera, scene_outputs):
+        if self._staged_import_active():
+            self.cluster_pick_request = None
+            return
         if self.cluster_pick_request is None:
             return
         mouse_xy = self.cluster_pick_request
@@ -2626,6 +4195,9 @@ class GaussianSplattingGUI:
             self._set_pick_feedback(cluster_id, "noop")
 
     def _consume_marquee_pick_request(self, view_camera, scene_outputs):
+        if self._staged_import_active():
+            self.marquee_request = None
+            return
         if self.marquee_request is None or self.cluster_cache is None or self.cluster_cache_state != "ready":
             return
         start_xy, end_xy = self.marquee_request
@@ -2769,6 +4341,9 @@ class GaussianSplattingGUI:
             self._set_pick_feedback(None, "marquee no candidate")
 
     def _create_active_group_from_pending(self):
+        if self._staged_import_active():
+            self._set_cluster_status("selection edits are disabled while a staged import is active")
+            return
         if len(self.pending_parts) == 0:
             self._set_cluster_status("create cuboid: no pending parts")
             return
@@ -2956,6 +4531,9 @@ class GaussianSplattingGUI:
         return elements
 
     def _save_active_gaussians(self):
+        if self._staged_import_active():
+            self._set_cluster_status('save active is disabled while a staged import is active')
+            return
         if not self._active_group_has_cuboid() or len(self.active_group.get('parts', [])) == 0:
             self._set_cluster_status('no active gaussians to save')
             return
@@ -2973,15 +4551,7 @@ class GaussianSplattingGUI:
             self._set_cluster_status('no active gaussians to save')
             return
         full_indices = torch.unique(torch.cat([indices for _, _, indices in export_parts], dim=0))
-        cluster_lookup = np.full((full_indices.shape[0],), -1, dtype=np.int32)
-        full_indices_cpu = full_indices.detach().cpu().numpy().astype(np.int64, copy=False)
-        index_to_row = {int(idx): row for row, idx in enumerate(full_indices_cpu.tolist())}
-        for part_idx, _, indices in export_parts:
-            for global_index in indices.detach().cpu().numpy().astype(np.int64, copy=False).tolist():
-                row = index_to_row.get(int(global_index))
-                if row is not None:
-                    cluster_lookup[row] = part_idx
-        full_elements = self._make_export_elements(full_indices, cluster_lookup)
+        full_elements = self._make_export_elements(full_indices, self._cluster_idx_values_for_export(full_indices))
         PlyData([PlyElement.describe(full_elements, 'vertex')]).write(os.path.join(export_root, 'gaussian_full.ply'))
         for part_idx, _, indices in export_parts:
             elements = self._make_export_elements(indices, np.full((indices.shape[0],), part_idx, dtype=np.int32))
@@ -2990,6 +4560,9 @@ class GaussianSplattingGUI:
         self._set_cluster_status(f'saved active gaussians: {len(export_parts)} part(s)')
 
     def _save_full_scene_gaussians(self):
+        if self._staged_import_active():
+            self._set_cluster_status('save full is disabled while a staged import is active')
+            return
         self._commit_active_group_if_dirty()
         scene_count = self.engine['scene']._xyz.shape[0]
         feature_count = self.engine['feature'].get_point_features.shape[0]
@@ -3000,10 +4573,7 @@ class GaussianSplattingGUI:
         export_root = os.path.join(self.opt.MODEL_PATH, 'scene_exports', time.strftime('%Y%m%d_%H%M%S'))
         os.makedirs(export_root, exist_ok=True)
         indices = torch.arange(count, device=self.engine['scene']._xyz.device, dtype=torch.long)
-        if self.cluster_cache is not None and self.cluster_cache.get('labels') is not None and self.cluster_cache['labels'].shape[0] >= count:
-            cluster_idx_values = self.cluster_cache['labels'][:count].detach().cpu().numpy().astype(np.int32, copy=False)
-        else:
-            cluster_idx_values = np.full((count,), -1, dtype=np.int32)
+        cluster_idx_values = self._cluster_idx_values_for_export(indices)
         elements = self._make_export_elements(indices, cluster_idx_values)
         output_path = os.path.join(export_root, 'gaussian_scene_full.ply')
         PlyData([PlyElement.describe(elements, 'vertex')]).write(output_path)
@@ -3046,16 +4616,62 @@ class GaussianSplattingGUI:
             self.save_flag = True
         def callback_reload():
             self.reload_flag = True
+        def callback_instance_select(sender):
+            if self._staged_import_active():
+                dpg.set_value(sender, self.current_instance_name)
+                self._set_cluster_status("instance switching is disabled while a staged import is active")
+                return
+            selected_name = str(dpg.get_value(sender))
+            if selected_name not in self.instance_root_by_name:
+                return
+            if os.path.abspath(self.instance_root_by_name[selected_name]) == os.path.abspath(self.current_instance_root):
+                return
+            self.instance_switch_requested = selected_name
+        def callback_open_import_instance():
+            self._open_import_instance_popup()
+        def callback_import_popup_select(sender):
+            self._set_import_popup_selection(str(dpg.get_value(sender)))
+        def callback_import_popup_ok():
+            selected_label = self.import_popup_selected_label
+            target_root = self.import_popup_root_by_label.get(selected_label)
+            if not target_root:
+                if dpg.does_item_exist("_ImportInstanceError"):
+                    dpg.set_value("_ImportInstanceError", "Select an instance to import.")
+                return
+            self.import_instance_requested = target_root
+            if dpg.does_item_exist("_ImportInstanceError"):
+                dpg.set_value("_ImportInstanceError", "")
+            if dpg.does_item_exist("_ImportInstanceOkButton"):
+                dpg.configure_item("_ImportInstanceOkButton", enabled=False)
+        def callback_import_popup_cancel():
+            self.import_instance_requested = None
+            self._close_import_instance_popup(clear_candidates=True)
         def callback_cluster():
             self._cancel_preview_for_selection_change()
             self.recluster_requested = True
         def callback_recluster():
+            if self._staged_import_active():
+                self._set_cluster_status("recluster is disabled while a staged import is active")
+                return
             self._cancel_preview_for_selection_change()
             self.recluster_requested = True
         def callback_reshuffle_color():
             self.label_to_color = np.random.rand(1000, 3)
             self._refresh_cluster_colors()
+        def callback_cluster_source(sender):
+            if self._staged_import_active():
+                dpg.set_value(sender, self._cluster_source_gui_value())
+                self._set_cluster_status("cluster source is locked while a staged import is active")
+                return
+            gui_value = str(dpg.get_value(sender))
+            source_key = CLUSTER_SOURCE_GUI_TO_KEY.get(gui_value, CLUSTER_SOURCE_FEATURE)
+            self._set_cluster_source(source_key)
+            self._invalidate_cluster_cache(reason=f"cluster source={gui_value}")
         def callback_cluster_method(sender):
+            if self._staged_import_active():
+                dpg.set_value(sender, self.cluster_method)
+                self._set_cluster_status("cluster method is locked while a staged import is active")
+                return
             self.cluster_method = dpg.get_value(sender)
             self._invalidate_cluster_cache(reason=f"cluster method={self.cluster_method}")
         def callback_cluster_sample_size(sender):
@@ -3089,6 +4705,9 @@ class GaussianSplattingGUI:
         def callback_hide_small_residue(sender):
             self.hide_small_residue = dpg.get_value(sender)
             self._on_residue_settings_changed(f"residue hide={'on' if self.hide_small_residue else 'off'}")
+        def callback_hide_unassigned_gaussians(sender):
+            self.hide_unassigned_gaussians = dpg.get_value(sender)
+            self._update_cluster_status_widget()
         def callback_residue_max_size(sender):
             self.residue_max_size = int(max(0, dpg.get_value(sender)))
             dpg.set_value(sender, self.residue_max_size)
@@ -3129,6 +4748,9 @@ class GaussianSplattingGUI:
                 self._end_cuboid_drag()
             self.cuboid_manipulation = next_value
         def callback_show_active():
+            if self._staged_import_active():
+                self._set_cluster_status("show active toggle is disabled while a staged import is active")
+                return
             self.show_active = not self.show_active
             self._update_cluster_status_widget()
         def callback_transform_mode(sender):
@@ -3136,18 +4758,33 @@ class GaussianSplattingGUI:
             self.extend_handle = None
         def callback_apply_active():
             self._apply_and_clear_active_group()
+        def callback_copy_active():
+            self._copy_active_gaussians()
+        def callback_delete_active():
+            self._delete_active_gaussians()
         def callback_undo_apply():
             self._undo_last_apply()
         def callback_redo_apply():
             self._redo_last_apply()
         def callback_cancel_active():
-            self._cancel_active_group()
+            if self._staged_import_active():
+                self._cancel_staged_import()
+            else:
+                self._cancel_active_group()
         def callback_preview_max(sender):
+            if self._staged_import_active():
+                dpg.set_value(sender, self.preview_max_gaussians)
+                self._set_cluster_status("preview selection settings are locked while a staged import is active")
+                return
             self.preview_max_gaussians = int(max(1, dpg.get_value(sender)))
             self.component_cache = {}
             if self._active_group_has_cuboid():
                 self._rebuild_active_group_for_score(0.0 if self.last_score_threshold is None else self.last_score_threshold)
         def callback_cuboid_percentile(sender):
+            if self._staged_import_active():
+                dpg.set_value(sender, self.cuboid_percentile)
+                self._set_cluster_status("cuboid refit is locked while a staged import is active")
+                return
             percentile = float(np.clip(dpg.get_value(sender), 50.0, 100.0))
             self.cuboid_percentile = percentile
             if dpg.get_value(sender) != percentile:
@@ -3184,6 +4821,17 @@ class GaussianSplattingGUI:
                                  min_value=0.0, max_value=1.0, tag="_Scale")
             dpg.add_slider_float(label="ScoreThres", default_value=0.0,
                                  min_value=0.0, max_value=1.0, tag="_ScoreThres")
+            dpg.add_text("Instance")
+            dpg.add_combo(
+                tuple(self.instance_names),
+                label="",
+                default_value=self.current_instance_name,
+                callback=callback_instance_select,
+                tag="_InstanceSelect",
+                width=-1,
+                enabled=len(self.instance_names) > 1,
+            )
+            dpg.add_button(label="Import Instance", callback=callback_open_import_instance, tag="_ImportInstanceButton", width=-1)
 
             dpg.add_text("Render option", tag="render")
             with dpg.group(horizontal=True):
@@ -3192,11 +4840,20 @@ class GaussianSplattingGUI:
                 dpg.add_checkbox(label="3D CLUSTER", default_value=self.render_mode_cluster, callback=render_mode_cluster_callback, user_data="Some Data")
 
             dpg.add_text("Cluster Edit", tag="cluster_edit")
-            dpg.add_button(label="Recluster", callback=callback_recluster, user_data="Some Data", width=-1)
+            dpg.add_button(label="Recluster", callback=callback_recluster, user_data="Some Data", width=-1, tag="_ReclusterButton")
+            dpg.add_text("Source")
+            dpg.add_combo(
+                tuple(CLUSTER_SOURCE_GUI_TO_KEY.keys()),
+                label="",
+                default_value=self._cluster_source_gui_value(),
+                callback=callback_cluster_source,
+                tag="_ClusterSource",
+                width=-1,
+            )
             dpg.add_text("Method")
             dpg.add_combo(("HDBSCAN", "HDBSCANRefined", "NormalizedCut"), label="", default_value=self.cluster_method, callback=callback_cluster_method, tag="_ClusterMethod", width=-1)
             dpg.add_text("Cache: stale\nClusters: none", tag="_cluster_summary_line1")
-            dpg.add_text("Last: none", tag="_cluster_summary_line2")
+            dpg.add_text("Status: stale: click Recluster\nLast: none", tag="_cluster_summary_line2")
             dpg.add_text("Pending: 0 | Active: 0 | G: 0\nPick: none", tag="_cluster_summary_line3")
 
             dpg.add_checkbox(label="Cuboid Manipulation", callback=callback_cuboid_manipulation, user_data="Some Data", tag="_CuboidManipulation")
@@ -3210,16 +4867,20 @@ class GaussianSplattingGUI:
                     dpg.add_button(label="Add\nActive", callback=callback_add_active, user_data="Some Data", tag="_AddActiveButton", width=-1, height=38)
                     dpg.add_button(label="Remove\nActive", callback=callback_remove_active, user_data="Some Data", tag="_RemoveActiveButton", width=-1, height=38)
                 with dpg.table_row():
-                    dpg.add_button(label="Clear\nActive", callback=callback_clear_active, user_data="Some Data", width=-1, height=38)
-                    dpg.add_button(label="Apply", callback=callback_apply_active, user_data="Some Data", width=-1, height=38)
-                    dpg.add_button(label="Cancel", callback=callback_cancel_active, user_data="Some Data", width=-1, height=38)
+                    dpg.add_button(label="Clear\nActive", callback=callback_clear_active, user_data="Some Data", tag="_ClearActiveButton", width=-1, height=38)
+                    dpg.add_button(label="Apply", callback=callback_apply_active, user_data="Some Data", tag="_ApplyActiveButton", width=-1, height=38)
+                    dpg.add_button(label="Cancel", callback=callback_cancel_active, user_data="Some Data", tag="_CancelActiveButton", width=-1, height=38)
                 with dpg.table_row():
-                    dpg.add_button(label="Undo", callback=callback_undo_apply, user_data="Some Data", width=-1, height=38)
-                    dpg.add_button(label="Redo", callback=callback_redo_apply, user_data="Some Data", width=-1, height=38)
+                    dpg.add_button(label="Undo", callback=callback_undo_apply, user_data="Some Data", tag="_UndoButton", width=-1, height=38)
+                    dpg.add_button(label="Redo", callback=callback_redo_apply, user_data="Some Data", tag="_RedoButton", width=-1, height=38)
                     dpg.add_button(label="Show\nActive", callback=lambda: callback_show_active(), tag="_ShowActiveButton", width=-1, height=38)
                 with dpg.table_row():
-                    dpg.add_button(label="Save\nActive", callback=callback_save_active, user_data="Some Data", width=-1, height=38)
-                    dpg.add_button(label="Save\nFull", callback=callback_save_full_scene, user_data="Some Data", width=-1, height=38)
+                    dpg.add_button(label="Copy\nActive", callback=callback_copy_active, user_data="Some Data", tag="_CopyActiveButton", width=-1, height=38)
+                    dpg.add_button(label="Delete\nActive", callback=callback_delete_active, user_data="Some Data", tag="_DeleteActiveButton", width=-1, height=38)
+                    dpg.add_button(label="Save\nActive", callback=callback_save_active, user_data="Some Data", tag="_SaveActiveButton", width=-1, height=38)
+                with dpg.table_row():
+                    dpg.add_button(label="Save\nFull", callback=callback_save_full_scene, user_data="Some Data", tag="_SaveFullButton", width=-1, height=38)
+                    dpg.add_spacer()
                     dpg.add_spacer()
 
             with dpg.tab_bar(tag="_cluster_part_tabs"):
@@ -3240,6 +4901,7 @@ class GaussianSplattingGUI:
 
             dpg.add_text("Residue", tag="_ResidueHeader")
             dpg.add_text("Residue: active 0 | global 0", tag="_cluster_residue_line")
+            dpg.add_checkbox(label="Hide Unassigned Gaussians", default_value=self.hide_unassigned_gaussians, callback=callback_hide_unassigned_gaussians, tag="_HideUnassignedGaussians")
             dpg.add_checkbox(label="Hide Small Residue", default_value=self.hide_small_residue, callback=callback_hide_small_residue, tag="_HideSmallResidue")
             dpg.add_text("Residue Max / Scope")
             with dpg.table(header_row=False, resizable=False, policy=dpg.mvTable_SizingStretchProp, borders_innerV=False, borders_outerV=False, borders_innerH=False, borders_outerH=False):
@@ -3266,6 +4928,23 @@ class GaussianSplattingGUI:
                 self.do_pca()   # calculate new self.proj_mat after loading new .ply file
                 print("loading model file done.")
                 self.load_model = True
+        with dpg.window(
+            label="Import Instance",
+            tag="_ImportInstancePopup",
+            modal=True,
+            show=False,
+            no_resize=False,
+            width=420,
+            height=360,
+            pos=[max(20, self.window_width // 3), max(20, self.window_height // 5)],
+        ):
+            dpg.add_text("Select an instance to import into the current scene.")
+            dpg.add_text("Selected: none", tag="_ImportInstanceSelected")
+            dpg.add_listbox((), num_items=12, width=-1, callback=callback_import_popup_select, tag="_ImportInstanceList")
+            dpg.add_text("", tag="_ImportInstanceError", wrap=380)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="OK", callback=callback_import_popup_ok, tag="_ImportInstanceOkButton", enabled=False, width=120)
+                dpg.add_button(label="Cancel", callback=callback_import_popup_cancel, tag="_ImportInstanceCancelButton", width=120)
         if self.debug:
             with dpg.collapsing_header(label="Debug"):
                 dpg.add_separator()
@@ -3511,31 +5190,94 @@ class GaussianSplattingGUI:
 
     @torch.no_grad()
     def fetch_data(self, view_camera):
+        if not self._ensure_runtime_geometry_consistency():
+            self._update_cluster_status_widget()
+            return
+
+        if self.instance_switch_requested is not None:
+            requested_name = self.instance_switch_requested
+            self.instance_switch_requested = None
+            target_instance_root = self.instance_root_by_name.get(requested_name)
+            if target_instance_root is not None:
+                print(f"Switching instance to {requested_name}...")
+                try:
+                    self._reload_instance_artifacts(target_instance_root, f"switched to {requested_name}")
+                except Exception as exc:
+                    self.load_model = True
+                    self._refresh_instance_selector_widget()
+                    self._set_cluster_status(f"error: {exc}", state="stale")
+                    print(f"Instance switch failed: {exc}")
+
+        if self.reload_flag:
+            self.reload_flag = False
+            print("Reloading current model file...")
+            try:
+                self._reload_instance_artifacts(self.current_instance_root, "reloaded data")
+            except Exception as exc:
+                self.load_model = True
+                self._refresh_instance_selector_widget()
+                self._set_cluster_status(f"error: {exc}", state="stale")
+                print(f"Reload failed: {exc}")
+
+        if self.import_instance_requested is not None:
+            target_instance_root = self.import_instance_requested
+            self.import_instance_requested = None
+            print(f"Importing instance from {target_instance_root}...")
+            try:
+                self._stage_import_instance(target_instance_root)
+                self._close_import_instance_popup(clear_candidates=True)
+            except Exception as exc:
+                if dpg.does_item_exist("_ImportInstanceError"):
+                    dpg.set_value("_ImportInstanceError", str(exc))
+                if dpg.does_item_exist("_ImportInstanceOkButton"):
+                    dpg.configure_item("_ImportInstanceOkButton", enabled=self.import_popup_selected_label is not None)
+                print(f"Import instance failed: {exc}")
+
         scale = dpg.get_value('_Scale')
         score_thres = dpg.get_value('_ScoreThres')
         self.last_view_camera = view_camera
 
-        if self._active_group_has_cuboid() and (self.cluster_pick_request is not None or self.marquee_request is not None) and self.active_group["dirty_transform"]:
+        active_group = self.active_group if self._active_group_has_cuboid() else None
+        if active_group is not None and (self.cluster_pick_request is not None or self.marquee_request is not None) and active_group["dirty_transform"]:
             self._commit_active_group()
+            active_group = self.active_group if self._active_group_has_cuboid() else None
 
-        if self._active_group_has_cuboid() and abs(float(score_thres) - float(self.active_group.get("score_thres", score_thres))) > 1e-6:
+        if (not self._staged_import_active()) and active_group is not None and abs(float(score_thres) - float(active_group.get("score_thres", score_thres))) > 1e-6:
             self._rebuild_active_group_for_score(score_thres)
+            active_group = self.active_group if self._active_group_has_cuboid() else None
 
         self.last_score_threshold = score_thres
         if self.last_scale_value is None:
             self.last_scale_value = scale
         elif abs(scale - self.last_scale_value) > 1e-6:
             self.last_scale_value = scale
-            if self.cluster_cache is not None or self.cluster_cache_state == "clustering":
+            if (not self._staged_import_active()) and (self.cluster_cache is not None or self.cluster_cache_state == "clustering"):
                 self._commit_active_group_if_dirty()
                 self._invalidate_cluster_cache(reason=f"scale changed to {scale:.3f}")
 
-        if self.recluster_requested:
+        if self.recluster_requested and not self._staged_import_active():
             self.recluster_requested = False
             self._start_recluster(scale)
+        elif self.recluster_requested and self._staged_import_active():
+            self.recluster_requested = False
         self._poll_cluster_job()
 
         hidden_mask = self._combined_hidden_mask()
+        scene_count = int(self.engine['scene'].get_xyz.shape[0])
+        feature_count = int(self.engine['feature'].get_xyz.shape[0])
+        if hidden_mask is not None and int(hidden_mask.shape[0]) != scene_count:
+            self._drop_stale_active_group(reason="filtered mask no longer matches scene geometry")
+            self._drop_stale_cluster_cache(reason="filtered mask no longer matches scene geometry")
+            self._set_cluster_status(
+                f"stale: filtered mask mismatch (mask={int(hidden_mask.shape[0])}, scene={scene_count})",
+                state="stale",
+            )
+            hidden_mask = None
+
+        if scene_count != feature_count:
+            self._set_cluster_status(self._runtime_alignment_error_message(context="render"), state="stale")
+            self._update_cluster_status_widget()
+            return
 
         scene_outputs = render(view_camera, self.engine['scene'], self.opt, self.bg_color, filtered_mask=hidden_mask)
         feature_outputs = render_contrastive_feature(view_camera, self.engine['feature'], self.opt, self.bg_feature, filtered_mask=hidden_mask)
@@ -3545,6 +5287,14 @@ class GaussianSplattingGUI:
         self.rendered_cluster = None
         self.cluster_pick_feature_render = None
         cluster_ready = self.cluster_cache is not None and self.cluster_cache_state == "ready"
+        if cluster_ready:
+            point_colors = self.cluster_cache.get("point_colors_torch")
+            point_codes = self.cluster_cache.get("point_codes_torch")
+            if (torch.is_tensor(point_colors) and int(point_colors.shape[0]) != scene_count) or (
+                torch.is_tensor(point_codes) and int(point_codes.shape[0]) != feature_count
+            ):
+                self._drop_stale_cluster_cache(reason="cluster cache render buffers no longer match current geometry")
+                cluster_ready = False
         need_cluster_color_render = cluster_ready and (self.render_mode_cluster or self.cluster_pick_request is not None)
         if need_cluster_color_render:
             self.rendered_cluster = render(
@@ -3601,17 +5351,6 @@ class GaussianSplattingGUI:
             self.engine['feature'].roll_back()
             # except:
                 # pass
-        
-        if self.reload_flag:
-            self.reload_flag = False
-            print("loading model file...")
-            self.engine['scene'].load_ply(self.opt.SCENE_PCD_PATH)
-            self.engine['feature'].load_ply(self.opt.FEATURE_PCD_PATH)
-            self.engine['scale_gate'].load_state_dict(_load_scale_gate_state_dict(self.opt.SCALE_GATE_PATH))
-            self._validate_scene_feature_alignment(context="reload")
-            self.do_pca()   # calculate self.proj_mat
-            self.load_model = True
-            self._invalidate_cluster_cache(reason="reloaded data")
 
         score_map = None
         if len(self.new_click_xy) > 0:
@@ -3748,6 +5487,9 @@ if __name__ == "__main__":
     parser.add_argument('--exp_name', type=str, default="")
     parser.add_argument('-f', '--feature_iteration', type=int, default=-1)
     parser.add_argument('-s', '--scene_iteration', type=int, default=-1)
+    parser.add_argument('--cluster_source', type=str, default=CLUSTER_SOURCE_FEATURE, choices=[CLUSTER_SOURCE_FEATURE, CLUSTER_SOURCE_EXTERNAL, CLUSTER_SOURCE_PLY_LABEL])
+    parser.add_argument('--cluster_assignment_path', type=str, default="")
+    parser.add_argument('--cluster_assignment_resolution', type=int, default=64)
     parser.add_argument('--cluster_method', type=str, default="HDBSCANRefined", choices=["HDBSCAN", "HDBSCANRefined", "NormalizedCut"])
     parser.add_argument('--cluster_sample_size', type=int, default=20000)
     parser.add_argument('--cluster_graph_k', type=int, default=16)
@@ -3765,10 +5507,18 @@ if __name__ == "__main__":
     parser.add_argument('--exclude_residue_on_active_export', type=_str2bool, default=True)
 
     args = parser.parse_args()
+    if args.cluster_assignment_resolution <= 0:
+        raise ValueError(f"cluster_assignment_resolution must be positive, got {args.cluster_assignment_resolution}")
 
     opt = CONFIG()
 
-    opt.MODEL_PATH = args.model_path
+    opt.REQUESTED_MODEL_PATH = os.path.abspath(args.model_path)
+    opt.REQUESTED_FEATURE_MODEL_PATH = os.path.abspath(args.feature_model_path) if args.feature_model_path else ""
+    opt.REQUESTED_EXP_NAME = args.exp_name
+    opt.REQUESTED_FEATURE_GAUSSIAN_ITERATION = args.feature_iteration
+    opt.REQUESTED_SCENE_GAUSSIAN_ITERATION = args.scene_iteration
+
+    opt.MODEL_PATH = opt.REQUESTED_MODEL_PATH
     if args.feature_model_path:
         opt.FEATURE_MODEL_PATH = args.feature_model_path
     elif args.exp_name:
@@ -3780,6 +5530,9 @@ if __name__ == "__main__":
         opt.FEATURE_MODEL_PATH = ""
     opt.FEATURE_GAUSSIAN_ITERATION = args.feature_iteration
     opt.SCENE_GAUSSIAN_ITERATION = args.scene_iteration
+    opt.CLUSTER_SOURCE = args.cluster_source
+    opt.CLUSTER_ASSIGNMENT_PATH = args.cluster_assignment_path
+    opt.CLUSTER_ASSIGNMENT_RESOLUTION = args.cluster_assignment_resolution
     opt.CLUSTER_METHOD = args.cluster_method
     opt.CLUSTER_SAMPLE_SIZE = args.cluster_sample_size
     opt.CLUSTER_GRAPH_K = args.cluster_graph_k
@@ -3797,7 +5550,26 @@ if __name__ == "__main__":
     opt.EXCLUDE_RESIDUE_ON_ACTIVE_EXPORT = args.exclude_residue_on_active_export
     opt.CUBOID_PERCENTILE = 100.0
 
-    _resolve_model_artifacts(opt)
+    _initialize_model_browser(opt)
+    initial_instance_root = getattr(opt, "MODEL_BROWSER_SELECTED_INSTANCE", opt.MODEL_PATH)
+    initial_feature_model_request = _resolve_feature_model_request_for_instance(opt, initial_instance_root)
+    initial_bundle = _resolve_model_artifact_bundle(
+        initial_instance_root,
+        initial_feature_model_request,
+        opt.SCENE_GAUSSIAN_ITERATION,
+        opt.FEATURE_GAUSSIAN_ITERATION,
+        opt.CLUSTER_SOURCE,
+    )
+    _apply_resolved_model_artifact_bundle(opt, initial_bundle)
+
+    print(f"Resolved scene root: {initial_bundle['scene_root']}")
+    print(f"Using scene iteration {initial_bundle['scene_iteration']}: {initial_bundle['scene_pcd_path']}")
+    if initial_bundle["feature_pcd_path"]:
+        print(f"Using feature root: {initial_bundle['feature_root']}")
+        print(f"Using feature iteration {initial_bundle['feature_iteration']}: {initial_bundle['feature_pcd_path']}")
+        print(f"Using scale gate: {initial_bundle['scale_gate_path']}")
+    else:
+        print(f"Using feature fallback from scene root: {initial_bundle['scene_root']}")
 
     gs_model = GaussianModel(opt.sh_degree)
     feat_gs_model = FeatureGaussianModel(opt.FEATURE_DIM)
