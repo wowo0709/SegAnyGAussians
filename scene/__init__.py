@@ -168,13 +168,13 @@ class Scene:
 
         if os.path.exists(os.path.join(args.source_path, "sparse")) and not os.path.exists(os.path.join(args.source_path, "transforms.json")):
             print(f"Allow Camera Principle Point Shift: {args.allow_principle_point_shift}")
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, need_features = args.need_features, need_masks = args.need_masks, sample_rate = sample_rate, allow_principle_point_shift = args.allow_principle_point_shift, replica = 'replica' in args.model_path)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, need_features = args.need_features, need_masks = args.need_masks, sample_rate = sample_rate, allow_principle_point_shift = args.allow_principle_point_shift, replica = 'replica' in args.model_path, mask_scales_dir_name=getattr(args, "mask_scales_dir_name", "mask_scales"))
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
-            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, init_radius_scale=args.init_radius_scale, init_min_radius=args.init_min_radius)
+            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.images, args.white_background, args.eval, need_features = args.need_features, need_masks = args.need_masks, init_radius_scale=args.init_radius_scale, init_min_radius=args.init_min_radius, mask_scales_dir_name=getattr(args, "mask_scales_dir_name", "mask_scales"))
         elif os.path.exists(os.path.join(args.source_path, "transforms.json")):
             print("Found transforms.json file, assuming Lerf data set!")
-            scene_info = sceneLoadTypeCallbacks["Lerf"](args.source_path, args.white_background, args.eval, init_radius_scale=args.init_radius_scale, init_min_radius=args.init_min_radius)
+            scene_info = sceneLoadTypeCallbacks["Lerf"](args.source_path, args.images, args.white_background, args.eval, need_features = args.need_features, need_masks = args.need_masks, init_radius_scale=args.init_radius_scale, init_min_radius=args.init_min_radius, mask_scales_dir_name=getattr(args, "mask_scales_dir_name", "mask_scales"))
         else:
             assert False, "Could not recognize scene type!"
 
@@ -210,6 +210,8 @@ class Scene:
                 self.gaussians.load_ply(_resolve_scene_checkpoint_path(self.model_path, self.loaded_iter))
             else:
                 if target == 'coarse_seg_everything':
+                    self.gaussians.load_ply(_resolve_scene_checkpoint_path(self.model_path, self.loaded_iter))
+                elif target == 'scene':
                     self.gaussians.load_ply(_resolve_scene_checkpoint_path(self.model_path, self.loaded_iter))
                 elif 'feature' not in target:
                     self.gaussians.load_ply(os.path.join(self.model_path,

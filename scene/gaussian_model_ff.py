@@ -759,11 +759,69 @@ class FeatureGaussianModel:
         # self.active_sh_degree = self.max_sh_degree
         self.gaussian_backend = detect_gaussian_backend_from_scale_dims(self.source_scale_dims)
         self.loaded_from_path = path
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.segment_times = 0
+        self._mask = torch.ones((self._xyz.shape[0],), dtype=torch.float, device="cuda")
 
     def resolve_gaussian_backend(self, requested_backend="auto", checkpoint_path=None):
         checkpoint_path = checkpoint_path or self.loaded_from_path or "<in-memory FeatureGaussianModel>"
         self.gaussian_backend = resolve_gaussian_backend(requested_backend, self.source_scale_dims, checkpoint_path)
         return self.gaussian_backend
+
+    def _require_inference_editable(self):
+        if self.optimizer is not None:
+            raise RuntimeError("Inference-time feature Gaussian editing requires optimizer=None.")
+
+    def _reset_inference_aux_buffers(self, count, device, mask=None):
+        self.max_radii2D = torch.zeros((count,), device=device)
+        self.xyz_gradient_accum = torch.zeros((count, 1), device=device)
+        self.denom = torch.zeros((count, 1), device=device)
+        if mask is None:
+            self._mask = torch.ones((count,), dtype=torch.float, device=device)
+        else:
+            self._mask = mask.to(device=device, dtype=torch.float).reshape(-1).contiguous()
+
+    def set_inference_tensors(self, xyz, point_features, opacity, scaling, rotation, mask=None):
+        self._require_inference_editable()
+        device = self._xyz.device if torch.is_tensor(self._xyz) and self._xyz.numel() > 0 else xyz.device
+        self._xyz = nn.Parameter(xyz.to(device=device, dtype=torch.float).contiguous().requires_grad_(True))
+        self._point_features = nn.Parameter(point_features.to(device=device, dtype=torch.float).contiguous().requires_grad_(True))
+        self._opacity = nn.Parameter(opacity.to(device=device, dtype=torch.float).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scaling.to(device=device, dtype=torch.float).contiguous().requires_grad_(True))
+        self._rotation = nn.Parameter(rotation.to(device=device, dtype=torch.float).contiguous().requires_grad_(True))
+        self._reset_inference_aux_buffers(int(self._xyz.shape[0]), device=device, mask=mask)
+
+    def append_inference_tensors(self, xyz, point_features, opacity, scaling, rotation):
+        self._require_inference_editable()
+        if xyz is None or int(xyz.shape[0]) == 0:
+            return
+        self.set_inference_tensors(
+            xyz=torch.cat((self._xyz.detach(), xyz.detach().to(self._xyz.device)), dim=0),
+            point_features=torch.cat((self._point_features.detach(), point_features.detach().to(self._point_features.device)), dim=0),
+            opacity=torch.cat((self._opacity.detach(), opacity.detach().to(self._opacity.device)), dim=0),
+            scaling=torch.cat((self._scaling.detach(), scaling.detach().to(self._scaling.device)), dim=0),
+            rotation=torch.cat((self._rotation.detach(), rotation.detach().to(self._rotation.device)), dim=0),
+            mask=None,
+        )
+
+    def prune_inference_tensors(self, prune_mask):
+        self._require_inference_editable()
+        if prune_mask is None:
+            return
+        prune_mask = prune_mask.to(device=self._xyz.device, dtype=torch.bool).reshape(-1)
+        if prune_mask.shape[0] != self._xyz.shape[0]:
+            raise ValueError(
+                f"Prune mask length {prune_mask.shape[0]} does not match feature Gaussian count {self._xyz.shape[0]}."
+            )
+        keep_mask = ~prune_mask
+        self.set_inference_tensors(
+            xyz=self._xyz.detach()[keep_mask],
+            point_features=self._point_features.detach()[keep_mask],
+            opacity=self._opacity.detach()[keep_mask],
+            scaling=self._scaling.detach()[keep_mask],
+            rotation=self._rotation.detach()[keep_mask],
+            mask=None,
+        )
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}

@@ -4,7 +4,7 @@ import torch
 import numpy as np
 from matplotlib import pyplot as plt
 from PIL import Image
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser, Namespace, SUPPRESS
 import cv2
 
 from arguments import ModelParams, PipelineParams
@@ -22,6 +22,17 @@ DATA_ROOT = './data/nerf_llff_data_for_3dgs/'
 # MODEL_PATH = './output/figurines/'
 
 ALLOW_PRINCIPLE_POINT_SHIFT = False
+SCALE_DEFINITION_CHOICES = ("legacy_3d_std", "area_only", "hybrid_area_3d_extent")
+
+def resolve_mask_root(image_root):
+    candidates = [
+        os.path.join(image_root, 'sam_masks'),
+        os.path.join(image_root, 'images', 'sam_masks'),
+    ]
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    raise FileNotFoundError(f"Could not find sam_masks under image_root: {image_root}")
 
 
 def get_combined_args(parser : ArgumentParser):
@@ -61,6 +72,44 @@ def generate_grid_index(depth):
     return grid
 
 
+def _compute_mask_area_ratio(mask):
+    return mask.float().mean()
+
+
+def _compute_legacy_3d_std(points_in_3d):
+    if points_in_3d.shape[0] < 2:
+        return points_in_3d.new_tensor(0.0)
+    return (points_in_3d.std(dim=0) * 2).norm()
+
+
+def _compute_robust_3d_extent(points_in_3d):
+    if points_in_3d.shape[0] < 2:
+        return points_in_3d.new_tensor(0.0)
+    q10 = torch.quantile(points_in_3d, 0.1, dim=0)
+    q90 = torch.quantile(points_in_3d, 0.9, dim=0)
+    return (q90 - q10).norm()
+
+
+def compute_mask_scale(mask, points_in_3d, scale_definition):
+    mask = mask.bool()
+    if mask.numel() == 0 or not mask.any():
+        return 0.0
+
+    area_ratio = _compute_mask_area_ratio(mask)
+    if scale_definition == "area_only":
+        return float(area_ratio.item())
+
+    points_in_mask = points_in_3d[mask]
+    if scale_definition == "legacy_3d_std":
+        return float(_compute_legacy_3d_std(points_in_mask).item())
+    if scale_definition == "hybrid_area_3d_extent":
+        robust_extent = _compute_robust_3d_extent(points_in_mask)
+        hybrid_scale = torch.sqrt(torch.clamp(area_ratio, min=0.0)) * robust_extent
+        return float(hybrid_scale.item())
+
+    raise ValueError(f"Unknown scale definition: {scale_definition}")
+
+
 if __name__ == '__main__':
     
     parser = ArgumentParser(description="Get scales for SAM masks")
@@ -76,6 +125,18 @@ if __name__ == '__main__':
     parser.add_argument('--precomputed_mask', default=None, type=str)
 
     parser.add_argument("--image_root", default='/datasets/nerf_data/360_v2/garden/', type=str)
+    parser.add_argument(
+        "--scale-definition",
+        default="legacy_3d_std",
+        choices=SCALE_DEFINITION_CHOICES,
+        type=str,
+    )
+    parser.add_argument(
+        "--mask-scales-dir-name",
+        dest="mask_scales_dir_name",
+        default=SUPPRESS,
+        type=str,
+    )
 
     args = get_combined_args(parser)
 
@@ -92,12 +153,13 @@ if __name__ == '__main__':
     scene = Scene(dataset, scene_gaussians, feature_gaussians, load_iteration=-1, feature_load_iteration=-1, shuffle=False, mode='eval', target='scene')
 
 
-    assert os.path.exists(os.path.join(dataset.source_path, 'images')) and "Please specify a valid image root."
-    assert os.path.join(dataset.source_path, 'sam_masks') and "Please run extract_segment_everything_masks first."
+    mask_root = resolve_mask_root(args.image_root)
 
     from tqdm import tqdm
-    OUTPUT_DIR = os.path.join(args.image_root, 'mask_scales')
+    OUTPUT_DIR = os.path.join(args.image_root, args.mask_scales_dir_name)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    print("Scale definition:", args.scale_definition)
+    print("Mask scales output dir:", OUTPUT_DIR)
 
     cameras = scene.getTrainCameras()
     background = torch.zeros(scene_gaussians.get_mask.shape[0], 3, device='cuda')
@@ -108,7 +170,7 @@ if __name__ == '__main__':
             rendered_pkg = gaussian_renderer.render_with_depth(view, scene_gaussians, render_pipe, background)
             depth = rendered_pkg['depth'].squeeze().cpu()
 
-            mask_path = os.path.join(dataset.source_path, 'sam_masks', view.image_name + '.pt')
+            mask_path = os.path.join(mask_root, view.image_name + '.pt')
             corresponding_masks = torch.load(mask_path, map_location='cpu').float()
 
             grid_index = generate_grid_index(depth)
@@ -136,11 +198,14 @@ if __name__ == '__main__':
                 torch.full((3, 3), 1.0).view(1, 1, 3, 3),
                 padding=1,
             )
-            eroded_masks = (eroded_masks >= 5).squeeze()  # (num_masks, H, W)
+            eroded_masks = (eroded_masks >= 5).squeeze(1)  # (num_masks, H, W)
 
             scale = torch.zeros(len(corresponding_masks))
             for mask_id in range(len(corresponding_masks)):
-                point_in_3D_in_mask = points_in_3D[eroded_masks[mask_id] == 1]
-                scale[mask_id] = (point_in_3D_in_mask.std(dim=0) * 2).norm()
+                scale[mask_id] = compute_mask_scale(
+                    eroded_masks[mask_id],
+                    points_in_3D,
+                    args.scale_definition,
+                )
 
             torch.save(scale, os.path.join(OUTPUT_DIR, view.image_name + '.pt'))

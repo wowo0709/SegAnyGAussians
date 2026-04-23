@@ -24,6 +24,8 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+
 class CameraInfo(NamedTuple):
     uid: int
     R: np.array
@@ -73,6 +75,127 @@ def getNerfppNorm(cam_info):
     translate = -center
 
     return {"translate": translate, "radius": radius}
+
+def _dedupe_preserve_order(items):
+    deduped = []
+    seen = set()
+    for item in items:
+        if item is None:
+            continue
+        normalized = os.path.abspath(item)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
+
+def _directory_has_images(path):
+    if not path or not os.path.isdir(path):
+        return False
+    for entry in os.listdir(path):
+        if Path(entry).suffix.lower() in IMAGE_EXTENSIONS:
+            return True
+    return False
+
+def _path_is_within(child, parent):
+    try:
+        Path(child).resolve().relative_to(Path(parent).resolve())
+        return True
+    except ValueError:
+        return False
+
+def _find_split_render_root(scene_path):
+    scene_path = Path(scene_path).resolve()
+    instance_name = scene_path.name
+    for parent in [scene_path] + list(scene_path.parents):
+        candidate = parent / "renders" / instance_name
+        if candidate.is_dir():
+            return str(candidate)
+    return None
+
+def _resolve_image_and_aux_roots(scene_path, images_hint=None):
+    scene_path = os.path.abspath(scene_path)
+    candidate_dirs = []
+    if images_hint:
+        if os.path.isabs(images_hint):
+            candidate_dirs.append(images_hint)
+        else:
+            candidate_dirs.append(os.path.join(scene_path, images_hint))
+    candidate_dirs.extend([
+        scene_path,
+        os.path.join(scene_path, "images"),
+        _find_split_render_root(scene_path),
+    ])
+    candidate_dirs = _dedupe_preserve_order(candidate_dirs)
+
+    image_root = None
+    for candidate in candidate_dirs:
+        if _directory_has_images(candidate):
+            image_root = candidate
+            break
+
+    if image_root is None:
+        for candidate in candidate_dirs:
+            if os.path.isdir(candidate):
+                image_root = candidate
+                break
+
+    if image_root is None:
+        image_root = scene_path
+
+    auxiliary_root = scene_path if _path_is_within(image_root, scene_path) else image_root
+    return image_root, auxiliary_root
+
+def _build_frame_path_candidates(root, file_path, extension):
+    normalized_rel = file_path[2:] if file_path.startswith("./") else file_path
+    stem, suffix = os.path.splitext(normalized_rel)
+    basename = os.path.basename(normalized_rel)
+    candidates = [
+        os.path.join(root, normalized_rel),
+        os.path.join(root, basename),
+        os.path.join(root, "images", basename),
+    ]
+    if not suffix and extension:
+        with_extension = stem + extension
+        basename_with_extension = os.path.basename(with_extension)
+        candidates.extend([
+            os.path.join(root, with_extension),
+            os.path.join(root, basename_with_extension),
+            os.path.join(root, "images", basename_with_extension),
+        ])
+    return _dedupe_preserve_order(candidates)
+
+def _resolve_frame_image_path(scene_path, file_path, extension, image_root=None):
+    candidate_roots = _dedupe_preserve_order([scene_path, image_root])
+    for root in candidate_roots:
+        for candidate in _build_frame_path_candidates(root, file_path, extension):
+            if os.path.exists(candidate):
+                return candidate
+    raise FileNotFoundError(
+        f"Could not resolve frame path '{file_path}' under scene '{scene_path}'"
+        + (f" or image root '{image_root}'." if image_root else ".")
+    )
+
+def _resolve_auxiliary_tensor_paths(auxiliary_root, image_name, need_features=False, need_masks=False, mask_scales_dir_name="mask_scales"):
+    features_path = None
+    masks_path = None
+    mask_scales_path = None
+
+    if need_features:
+        candidate = os.path.join(auxiliary_root, "clip_features", image_name + ".pt")
+        if os.path.exists(candidate):
+            features_path = candidate
+
+    if need_masks:
+        candidate = os.path.join(auxiliary_root, "sam_masks", image_name + ".pt")
+        if os.path.exists(candidate):
+            masks_path = candidate
+
+        candidate = os.path.join(auxiliary_root, mask_scales_dir_name, image_name + ".pt")
+        if os.path.exists(candidate):
+            mask_scales_path = candidate
+
+    return features_path, masks_path, mask_scales_path
 
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, features_folder = None, masks_folder = None, mask_scale_folder = None, sample_rate = 1.0, allow_principle_point_shift = False):
     cam_infos = []
@@ -170,7 +293,7 @@ def createRandomPointCloudFromCameraHull(train_cam_infos, num_pts=100_000, radiu
     shs = np.random.random((num_pts, 3)) / 255.0
     return xyz, SH2RGB(shs) * 255
 
-def readColmapSceneInfo(path, images, eval, llffhold=8, need_features=False, need_masks=False, sample_rate = 1.0, allow_principle_point_shift = False, replica=False):
+def readColmapSceneInfo(path, images, eval, llffhold=8, need_features=False, need_masks=False, sample_rate = 1.0, allow_principle_point_shift = False, replica=False, mask_scales_dir_name="mask_scales"):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -185,7 +308,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, need_features=False, nee
     reading_dir = "images" if images == None else images
     feature_dir = "clip_features"
     mask_dir = "sam_masks"
-    mask_scale_dir = "mask_scales"
+    mask_scale_dir = mask_scales_dir_name
 
     cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir), features_folder=os.path.join(path, feature_dir) if need_features else None, masks_folder=os.path.join(path, mask_dir) if need_masks else None, mask_scale_folder=os.path.join(path, mask_scale_dir) if need_masks else None, sample_rate=sample_rate, allow_principle_point_shift = allow_principle_point_shift)
 
@@ -225,8 +348,9 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, need_features=False, nee
                            ply_path=ply_path)
     return scene_info
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", image_root=None, auxiliary_root=None, need_features=False, need_masks=False, mask_scales_dir_name="mask_scales"):
     cam_infos = []
+    auxiliary_root = auxiliary_root or path
 
     with open(os.path.join(path, transformsfile)) as json_file:
         contents = json.load(json_file)
@@ -234,16 +358,21 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
         frames = contents["frames"]
         for idx, frame in enumerate(frames):
-            cam_name = os.path.join(path, frame["file_path"] + extension)
-
+            image_path = _resolve_frame_image_path(path, frame["file_path"], extension, image_root=image_root)
             matrix = np.linalg.inv(np.array(frame["transform_matrix"]))
             R = -np.transpose(matrix[:3,:3])
             R[:,0] = -R[:,0]
             T = -matrix[:3, 3]
 
-            image_path = os.path.join(path, cam_name)
-            image_name = Path(cam_name).stem
+            image_name = Path(image_path).stem
             image = Image.open(image_path)
+            features_path, masks_path, mask_scales_path = _resolve_auxiliary_tensor_paths(
+                auxiliary_root,
+                image_name,
+                need_features=need_features,
+                need_masks=need_masks,
+                mask_scales_dir_name=mask_scales_dir_name,
+            )
 
             im_data = np.array(image.convert("RGBA"))
 
@@ -259,37 +388,18 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             features=None, masks=None, mask_scales=None,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
+                            features_path=features_path, masks_path=masks_path, mask_scales_path=mask_scales_path))
             
     return cam_infos
 
-def _resolve_lerf_image_path(scene_path, file_path, extension):
-    image_path = os.path.normpath(os.path.join(scene_path, file_path))
-    if os.path.exists(image_path):
-        return image_path
-
-    normalized_rel = file_path[2:] if file_path.startswith("./") else file_path
-    candidate_paths = [
-        os.path.join(scene_path, normalized_rel),
-        os.path.join(scene_path, "images", os.path.basename(normalized_rel)),
-    ]
-    stem, suffix = os.path.splitext(normalized_rel)
-    if not suffix and extension:
-        candidate_paths.extend([
-            os.path.join(scene_path, stem + extension),
-            os.path.join(scene_path, "images", os.path.basename(stem + extension)),
-        ])
-
-    for candidate in candidate_paths:
-        candidate = os.path.normpath(candidate)
-        if os.path.exists(candidate):
-            return candidate
-
-    raise FileNotFoundError(f"Could not resolve LERF frame path '{file_path}' under '{scene_path}'.")
+def _resolve_lerf_image_path(scene_path, file_path, extension, image_root=None):
+    return _resolve_frame_image_path(scene_path, file_path, extension, image_root=image_root)
 
 
-def readCamerasFromLerfTransforms(path, transformsfile, white_background, extension=".jpg"):
+def readCamerasFromLerfTransforms(path, transformsfile, white_background, extension=".jpg", image_root=None, auxiliary_root=None, need_features=False, need_masks=False, mask_scales_dir_name="mask_scales"):
     cam_infos = []
+    auxiliary_root = auxiliary_root or path
 
     with open(os.path.join(path, transformsfile)) as json_file:
         contents = json.load(json_file)
@@ -305,9 +415,16 @@ def readCamerasFromLerfTransforms(path, transformsfile, white_background, extens
             R = np.transpose(matrix[:3,:3])
             T = matrix[:3, 3]
 
-            image_path = _resolve_lerf_image_path(path, frame["file_path"], extension)
+            image_path = _resolve_lerf_image_path(path, frame["file_path"], extension, image_root=image_root)
             image_name = Path(image_path).stem
             image = Image.open(image_path)
+            features_path, masks_path, mask_scales_path = _resolve_auxiliary_tensor_paths(
+                auxiliary_root,
+                image_name,
+                need_features=need_features,
+                need_masks=need_masks,
+                mask_scales_dir_name=mask_scales_dir_name,
+            )
 
             im_data = np.array(image.convert("RGBA"))
 
@@ -326,15 +443,37 @@ def readCamerasFromLerfTransforms(path, transformsfile, white_background, extens
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             features=None, masks=None, mask_scales=None,
                             image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
-                            cx=frame.get("cx"), cy=frame.get("cy")))
+                            cx=frame.get("cx"), cy=frame.get("cy"),
+                            features_path=features_path, masks_path=masks_path, mask_scales_path=mask_scales_path))
 
     return cam_infos
 
-def readNerfSyntheticInfo(path, white_background, eval, extension=".png", init_radius_scale=1.0, init_min_radius=0.05):
+def readNerfSyntheticInfo(path, images, white_background, eval, need_features=False, need_masks=False, extension=".png", init_radius_scale=1.0, init_min_radius=0.05, mask_scales_dir_name="mask_scales"):
+    image_root, auxiliary_root = _resolve_image_and_aux_roots(path, images)
     print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
+    train_cam_infos = readCamerasFromTransforms(
+        path,
+        "transforms_train.json",
+        white_background,
+        extension,
+        image_root=image_root,
+        auxiliary_root=auxiliary_root,
+        need_features=need_features,
+        need_masks=need_masks,
+        mask_scales_dir_name=mask_scales_dir_name,
+    )
     print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
+    test_cam_infos = readCamerasFromTransforms(
+        path,
+        "transforms_test.json",
+        white_background,
+        extension,
+        image_root=image_root,
+        auxiliary_root=auxiliary_root,
+        need_features=need_features,
+        need_masks=need_masks,
+        mask_scales_dir_name=mask_scales_dir_name,
+    )
     
     if not eval:
         train_cam_infos.extend(test_cam_infos)
@@ -361,9 +500,20 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png", init_r
                            ply_path=ply_path)
     return scene_info
 
-def readLerfInfo(path, white_background, eval, extension=".jpg", init_radius_scale=1.0, init_min_radius=0.05):
+def readLerfInfo(path, images, white_background, eval, need_features=False, need_masks=False, extension=".jpg", init_radius_scale=1.0, init_min_radius=0.05, mask_scales_dir_name="mask_scales"):
+    image_root, auxiliary_root = _resolve_image_and_aux_roots(path, images)
     print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromLerfTransforms(path, "transforms.json", white_background, extension)
+    train_cam_infos = readCamerasFromLerfTransforms(
+        path,
+        "transforms.json",
+        white_background,
+        extension,
+        image_root=image_root,
+        auxiliary_root=auxiliary_root,
+        need_features=need_features,
+        need_masks=need_masks,
+        mask_scales_dir_name=mask_scales_dir_name,
+    )
     test_cam_infos = []
     if not eval:
         train_cam_infos.extend(test_cam_infos)

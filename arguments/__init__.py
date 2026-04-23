@@ -64,6 +64,7 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.eval = False
         self.gaussian_backend = "auto"
+        self.mask_scales_dir_name = "mask_scales"
         self.init_radius_scale = 0.5
         self.init_min_radius = 0.05
 

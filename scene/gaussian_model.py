@@ -387,6 +387,64 @@ class GaussianModel:
         self.gaussian_backend = resolve_gaussian_backend(requested_backend, self.source_scale_dims, checkpoint_path)
         return self.gaussian_backend
 
+    def _require_inference_editable(self):
+        if self.optimizer is not None:
+            raise RuntimeError("Inference-time Gaussian editing requires optimizer=None.")
+
+    def _reset_inference_aux_buffers(self, count, device, mask=None):
+        self.max_radii2D = torch.zeros((count,), device=device)
+        self.xyz_gradient_accum = torch.zeros((count, 1), device=device)
+        self.denom = torch.zeros((count, 1), device=device)
+        if mask is None:
+            self._mask = torch.ones((count,), dtype=torch.float, device=device)
+        else:
+            self._mask = mask.to(device=device, dtype=torch.float).reshape(-1).contiguous()
+
+    def set_inference_tensors(self, xyz, features_dc, features_rest, opacity, scaling, rotation, mask=None):
+        self._require_inference_editable()
+        device = self._xyz.device if torch.is_tensor(self._xyz) and self._xyz.numel() > 0 else xyz.device
+        self._xyz = nn.Parameter(xyz.to(device=device, dtype=torch.float).contiguous().requires_grad_(True))
+        self._features_dc = nn.Parameter(features_dc.to(device=device, dtype=torch.float).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features_rest.to(device=device, dtype=torch.float).contiguous().requires_grad_(True))
+        self._opacity = nn.Parameter(opacity.to(device=device, dtype=torch.float).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scaling.to(device=device, dtype=torch.float).contiguous().requires_grad_(True))
+        self._rotation = nn.Parameter(rotation.to(device=device, dtype=torch.float).contiguous().requires_grad_(True))
+        self._reset_inference_aux_buffers(int(self._xyz.shape[0]), device=device, mask=mask)
+
+    def append_inference_tensors(self, xyz, features_dc, features_rest, opacity, scaling, rotation):
+        self._require_inference_editable()
+        if xyz is None or int(xyz.shape[0]) == 0:
+            return
+        self.set_inference_tensors(
+            xyz=torch.cat((self._xyz.detach(), xyz.detach().to(self._xyz.device)), dim=0),
+            features_dc=torch.cat((self._features_dc.detach(), features_dc.detach().to(self._features_dc.device)), dim=0),
+            features_rest=torch.cat((self._features_rest.detach(), features_rest.detach().to(self._features_rest.device)), dim=0),
+            opacity=torch.cat((self._opacity.detach(), opacity.detach().to(self._opacity.device)), dim=0),
+            scaling=torch.cat((self._scaling.detach(), scaling.detach().to(self._scaling.device)), dim=0),
+            rotation=torch.cat((self._rotation.detach(), rotation.detach().to(self._rotation.device)), dim=0),
+            mask=None,
+        )
+
+    def prune_inference_tensors(self, prune_mask):
+        self._require_inference_editable()
+        if prune_mask is None:
+            return
+        prune_mask = prune_mask.to(device=self._xyz.device, dtype=torch.bool).reshape(-1)
+        if prune_mask.shape[0] != self._xyz.shape[0]:
+            raise ValueError(
+                f"Prune mask length {prune_mask.shape[0]} does not match Gaussian count {self._xyz.shape[0]}."
+            )
+        keep_mask = ~prune_mask
+        self.set_inference_tensors(
+            xyz=self._xyz.detach()[keep_mask],
+            features_dc=self._features_dc.detach()[keep_mask],
+            features_rest=self._features_rest.detach()[keep_mask],
+            opacity=self._opacity.detach()[keep_mask],
+            scaling=self._scaling.detach()[keep_mask],
+            rotation=self._rotation.detach()[keep_mask],
+            mask=None,
+        )
+
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:

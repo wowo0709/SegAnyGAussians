@@ -593,6 +593,7 @@ def training(dataset, opt, pipe, iteration, saving_iterations, checkpoint_iterat
     print("Supervision mode:", opt.supervision_mode)
     print("Mask scale target:", opt.mask_scale_target)
     print("Mask scale tolerance:", opt.mask_scale_tolerance)
+    print("Mask scales dir:", getattr(dataset, "mask_scales_dir_name", "mask_scales"))
     print("Multiscale positive dilate kernel:", opt.multiscale_positive_dilate_kernel)
     assert opt.supervision_mode in {"multiscale", "single_scale_band"}
     if not (opt.ray_sample_rate > 0 or opt.num_sampled_rays > 0):
